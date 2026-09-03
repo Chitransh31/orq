@@ -67,6 +67,18 @@ using namespace orq::benchmarking;
 using A = ASharedVector<T>;
 using B = BSharedVector<T>;
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(join(customer,join(join(lineitem,part),orders)),"
+    "join(nation_region,region)),supplier),nation_name)";
+#else
+constexpr auto TPCH_PLAN_VARIANT = "original-orq";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(join(join(join(part,lineitem),orders),customer),nation),region),"
+    "join(supplier,nation_name))";
+#endif
+
 int main(int argc, char** argv) {
     orq_init(argc, argv);
     auto pid = runTime->getPartyID();
@@ -99,6 +111,8 @@ int main(int argc, char** argv) {
 
     auto db = TPCDatabase<T>(sf, sqlite_db);
     single_cout("Q8 SF " << db.scaleFactor);
+    single_cout("[QUERY_PLAN] query=q8 variant=" << TPCH_PLAN_VARIANT
+                                                  << " association=" << TPCH_PLAN_ASSOCIATION);
 
     ////////////////////////////////////////////////////////////////
     // Query
@@ -164,6 +178,28 @@ int main(int argc, char** argv) {
         OrderPartLineItemJoin, {"[CustKey]"}, {{"[NationKey]", "[NationKey]", copy<B>}});
     CustomerOrderPartLineItemJoin.deleteColumns({"[CustKey]"});
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+    // DuckDB canonical association builds the Region/Nation branch separately.
+    // ORQ still keeps the primary-key side on the left for each join.
+    auto SelectedCustomerNations = Region.inner_join(Nation1, {"[RegionKey]"}, {});
+    SelectedCustomerNations.project({"[NationKey]"});
+
+    auto RegionalCustomerOrderPartLineItemJoin = SelectedCustomerNations.inner_join(
+        CustomerOrderPartLineItemJoin, {"[NationKey]"}, {});
+    RegionalCustomerOrderPartLineItemJoin.deleteColumns({"[NationKey]"});
+
+    auto SupplierRegionalCustomerOrderPartLineItemJoin = Supplier.inner_join(
+        RegionalCustomerOrderPartLineItemJoin, {"[SuppKey]"},
+        {{"[NationKey]", "[NationKey]", copy<B>}});
+    SupplierRegionalCustomerOrderPartLineItemJoin.deleteColumns({"[SuppKey]"});
+
+    auto FinalJoin = Nation2.inner_join(SupplierRegionalCustomerOrderPartLineItemJoin,
+                                        {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}});
+
+    SelectedCustomerNations.deleteTable();
+    RegionalCustomerOrderPartLineItemJoin.deleteTable();
+    SupplierRegionalCustomerOrderPartLineItemJoin.deleteTable();
+#else
     auto N1CustomerOrderPartLineItemJoin = Nation1.inner_join(
         CustomerOrderPartLineItemJoin, {"[NationKey]"}, {{"[RegionKey]", "[RegionKey]", copy<B>}});
     N1CustomerOrderPartLineItemJoin.deleteColumns({"[NationKey]"});
@@ -179,6 +215,7 @@ int main(int argc, char** argv) {
 
     auto FinalJoin = Nation2.inner_join(SupplierRegN1CustomerOrderPartLineItemJoin, {"[NationKey]"},
                                         {{"[Name]", "[Name]", copy<B>}});
+#endif
 
     stopwatch::timepoint("join");
 

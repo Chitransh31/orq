@@ -7,6 +7,7 @@ import re
 import sys
 import subprocess
 import shlex
+import socket
 import time
 import statistics
 from dataclasses import dataclass, asdict
@@ -92,6 +93,7 @@ class ExperimentConfig:
     # Direct flags / inputs
     exp_protocol: int
     exp_setting: str
+    wan_sim: str
     exp_communicator: str
     specified_communicator: bool
     num_comm_threads: int
@@ -158,6 +160,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["same", "lan", "wan"],
         default="same",
         help="Setting; default: same",
+    )
+    parser.add_argument(
+        "--wan-sim",
+        dest="wan_sim",
+        choices=["auto", "off"],
+        default="auto",
+        help=(
+            "WAN traffic shaping; 'auto' manages scripts/comm/cluster-wan-sim.sh "
+            "for -s wan, while 'off' leaves the network untouched; default: auto"
+        ),
     )
     parser.add_argument(
         "-c",
@@ -278,12 +290,13 @@ def discover_iface_and_subnet(node_prefix: str) -> Tuple[Optional[str], Optional
     r"""
     Replicate the bash logic:
       _node=${node_prefix}1
-      _iface=$(ip route get $(dig +short ${_node} | tail -n 1) | grep -Po "((?<=dev )\S*)")
+      Resolve ${_node} with the system resolver, then inspect its route.
       SUBNET=$(ip -o -f inet addr show ${iface} | awk '{print $4}')
     """
     node = f"{node_prefix}1"
-    ip_candidate = _run_cmd(["bash", "-lc", f"dig +short {node} | tail -n 1"])
-    if not ip_candidate:
+    try:
+        ip_candidate = socket.gethostbyname(node)
+    except socket.gaierror:
         return None, None
     route_out = _run_cmd(["ip", "route", "get", ip_candidate])
     iface = _extract_iface_from_ip_route(route_out) if route_out else None
@@ -306,7 +319,7 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
 
     # Default logic: use protocol number
     num_parties = args.exp_protocol
-    
+
     # Parse input sizes from -r (a or a^b, comma-separated); only used when no scale factor
     row_exponents: List[int] = []
     exp_input_sizes: List[float] = []
@@ -374,6 +387,7 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
     return ExperimentConfig(
         exp_protocol=args.exp_protocol,
         exp_setting=args.exp_setting,
+        wan_sim=args.wan_sim,
         exp_communicator=exp_communicator,
         specified_communicator=specified_communicator,
         num_comm_threads=args.num_comm_threads,
@@ -560,6 +574,7 @@ def _select_run_config(
         "protocol": cfg.exp_protocol,
         "num_parties": cfg.num_parties,
         "setting": cfg.exp_setting,
+        "wan_sim": cfg.wan_sim,
         "communicator": cfg.exp_communicator,
         "comm_cmake_arg": cfg.comm_cmake_arg,
         "triples_type": cfg.triples_type,
@@ -766,38 +781,39 @@ def _manage_wan_simulation(cfg: ExperimentConfig, state: str) -> None:
     """
     if cfg.exp_setting != "wan":
         return
-    
+
     if cfg.num_parties <= 1:
         # No remote nodes to configure
         return
-    
+
     # Determine script path relative to run_experiment.py location
     script_dir = Path(__file__).parent
     cluster_wan_sim_script = script_dir / "comm" / "cluster-wan-sim.sh"
-    
+
     if not cluster_wan_sim_script.exists():
         print(f"Warning: WAN simulation script not found at {cluster_wan_sim_script}", file=sys.stderr)
         return
-    
+
     # Build list of nodes: node1, node2, ..., node{num_parties-1}
     # (node0 is the current node, so we start from 1)
     nodes = [f"{cfg.node_prefix}{i}" for i in range(1, cfg.num_parties)]
-    
+
     if not nodes:
         return
-    
+
     if state == "on":
         # Check baseline latencies before enabling WAN sim
         _check_ping_latencies(nodes, "Baseline ping latencies (before WAN simulation)")
-    
+
     # Run cluster-wan-sim.sh
     cmd = [str(cluster_wan_sim_script), state] + nodes
-    print(f"Managing WAN simulation: {'Enabling' if state == 'on' else 'Disabling'} on nodes {', '.join(nodes)}", flush=True)
+    action = "Enabling" if state == "on" else "Disabling"
+    print(f"Managing WAN simulation: {action} on nodes {', '.join(nodes)}", flush=True)
     res = subprocess.run(cmd, cwd=str(cluster_wan_sim_script.parent))
     if res.returncode != 0:
         print(f"Warning: cluster-wan-sim.sh returned non-zero exit code {res.returncode}", file=sys.stderr)
         return
-    
+
     if state == "on":
         # Check latencies after enabling WAN sim to verify it's working
         print("Waiting 0.5 seconds for network changes to take effect...", flush=True)
@@ -817,14 +833,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(arg_list)
     cfg = derive_config(args)
-    
-    # Enable WAN simulation if needed
+
     wan_sim_enabled = False
-    if cfg.exp_setting == "wan":
-        _manage_wan_simulation(cfg, "on")
-        wan_sim_enabled = True
-    
     try:
+        # Mark cleanup as required before enabling. If the enable command fails
+        # after shaping only some hosts, the finally block still removes it.
+        if cfg.exp_setting == "wan" and cfg.wan_sim == "auto":
+            wan_sim_enabled = True
+            _manage_wan_simulation(cfg, "on")
+
         # Build and prepare experiment environment
         perform_experiment_setup(cfg)
         # Run experiments

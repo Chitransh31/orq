@@ -57,6 +57,13 @@ using T = int64_t;
 
 using sec = duration<float, seconds::period>;
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
+#else
+constexpr auto TPCH_PLAN_VARIANT = "original-orq";
+#endif
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(customer,orders),lineitem)";
+
 int main(int argc, char** argv) {
     orq_init(argc, argv);
     auto pid = runTime->getPartyID();
@@ -90,6 +97,8 @@ int main(int argc, char** argv) {
     using B = BSharedVector<T>;
 
     single_cout("Q3 SF " << db.scaleFactor);
+    single_cout("[QUERY_PLAN] query=q3 variant=" << TPCH_PLAN_VARIANT
+                                                  << " association=" << TPCH_PLAN_ASSOCIATION);
 
     ////////////////////////////////////////////////////////////////
     // Query

@@ -4,3 +4,4 @@ pandas
 sphinx_rtd_theme
 breathe
 myst_parser
+duckdb==1.5.4

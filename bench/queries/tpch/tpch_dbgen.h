@@ -17,6 +17,8 @@
 
 #include <bit>
 #include <numeric>
+#include <optional>
+#include <random>
 #include <sstream>
 
 #include "orq.h"
@@ -67,6 +69,34 @@ using namespace COMPILED_MPC_PROTOCOL_NAMESPACE;
 template <typename T = int>
 class TPCDatabase {
    protected:
+    std::optional<uint64_t> dataSeed;
+    std::optional<std::mt19937_64> deterministicDataGenerator;
+
+    void configureDataGenerator() {
+        auto seed_arg = runTime->getArg<std::string>("tpch-seed", "z", "");
+        if (seed_arg.empty()) {
+            return;
+        }
+        if (seed_arg.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::invalid_argument("--tpch-seed must be an unsigned integer");
+        }
+
+        size_t parsed = 0;
+        uint64_t seed = 0;
+        try {
+            seed = std::stoull(seed_arg, &parsed);
+        } catch (const std::exception&) {
+            throw std::invalid_argument("--tpch-seed must be an unsigned integer");
+        }
+        if (parsed != seed_arg.size()) {
+            throw std::invalid_argument("--tpch-seed must be an unsigned integer");
+        }
+
+        dataSeed = seed;
+        deterministicDataGenerator.emplace(seed);
+        single_cout("TPC-H synthetic data seed: " << seed);
+    }
+
     /**
      * @brief Generate a random vector of type T (possibly signed) from [min_val,
      * max_val).
@@ -80,7 +110,13 @@ class TPCDatabase {
         using uT = std::make_unsigned_t<T>;
 
         Vector<uT> uvec(size);
-        runTime->populateLocalRandom(uvec);
+        if (deterministicDataGenerator.has_value()) {
+            for (auto& value : uvec) {
+                value = static_cast<uT>((*deterministicDataGenerator)());
+            }
+        } else {
+            runTime->populateLocalRandom(uvec);
+        }
 
         auto range = max_val - min_val;
 
@@ -110,9 +146,13 @@ class TPCDatabase {
 
     size_t lineItemsSize = 0;
 
-    TPCDatabase(double sf) : scaleFactor(sf), sqlite_db(nullptr) {}
+    TPCDatabase(double sf) : scaleFactor(sf), sqlite_db(nullptr) { configureDataGenerator(); }
 
-    TPCDatabase(double sf, sqlite3* sqlite_db) : scaleFactor(sf), sqlite_db(sqlite_db) {}
+    TPCDatabase(double sf, sqlite3* sqlite_db) : scaleFactor(sf), sqlite_db(sqlite_db) {
+        configureDataGenerator();
+    }
+
+    std::optional<uint64_t> getDataSeed() const { return dataSeed; }
 
     size_t customersSize() { return std::round(scaleFactor * CUSTOMERS_MULTIPLIER); }
 

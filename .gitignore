@@ -30,7 +30,9 @@ html
 src/external-lib/*
 !src/external-lib/CMakeLists.txt
 
+# Generated benchmark artifacts
 results/
+outputs/
 
 # Current CMake path hints let libOTE files reside either in the 
 # project root or in the build folder, gitignore for project root

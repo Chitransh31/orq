@@ -51,6 +51,13 @@ using B = BSharedVector<T>;
 
 const int SHIP_DATE = 60;
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
+#else
+constexpr auto TPCH_PLAN_VARIANT = "original-orq";
+#endif
+constexpr auto TPCH_PLAN_ASSOCIATION = "lineitem";
+
 int main(int argc, char** argv) {
     orq_init(argc, argv);
     auto pid = runTime->getPartyID();
@@ -72,6 +79,8 @@ int main(int argc, char** argv) {
 
     auto db = TPCDatabase<T>(sf, sqlite_db);
     single_cout("Q1 SF " << db.scaleFactor);
+    single_cout("[QUERY_PLAN] query=q1 variant=" << TPCH_PLAN_VARIANT
+                                                  << " association=" << TPCH_PLAN_ASSOCIATION);
 
     ////////////////////////////////////////////////////////////////
     // Query

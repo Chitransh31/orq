@@ -56,6 +56,15 @@ using T = int64_t;
 
 using sec = duration<float, seconds::period>;
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(join(customer,join(nation,region)),orders),lineitem),supplier)";
+#else
+constexpr auto TPCH_PLAN_VARIANT = "original-orq";
+constexpr auto TPCH_PLAN_ASSOCIATION = "orq-original-duplicated-lineitem-branches";
+#endif
+
 int main(int argc, char** argv) {
     orq_init(argc, argv);
     auto pid = runTime->getPartyID();
@@ -90,6 +99,8 @@ int main(int argc, char** argv) {
     using B = BSharedVector<T>;
 
     single_cout("Q5 SF " << db.scaleFactor);
+    single_cout("[QUERY_PLAN] query=q5 variant=" << TPCH_PLAN_VARIANT
+                                                  << " association=" << TPCH_PLAN_ASSOCIATION);
 
     ////////////////////////////////////////////////////////////////
     // Query
@@ -148,6 +159,31 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("Revenue");
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+    // DuckDB canonical association (orientation adapted to ORQ's PK/FK join contract):
+    // ((((Customer join (Nation join Region)) join Orders) join Lineitem) join Supplier)
+    auto SelectedCustomers = SelectedNations.inner_join(
+        Customer, {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}});
+
+    auto SelectedOrders = SelectedCustomers.inner_join(
+        Orders, {"[CustKey]"},
+        {{"[Name]", "[Name]", copy<B>}, {"[NationKey]", "[NationKey]", copy<B>}});
+
+    auto CustomerItems = SelectedOrders.inner_join(
+        Lineitem, {"[OrderKey]"},
+        {{"[Name]", "[Name]", copy<B>}, {"[NationKey]", "[NationKey]", copy<B>}});
+
+    auto FinalItems = Supplier.inner_join(CustomerItems, {"[SuppKey]", "[NationKey]"}, {});
+    FinalItems.deleteColumns({"[OrderKey]", "[LineNumber]", "[NationKey]", "[SuppKey]"});
+
+    Customer.deleteTable();
+    Orders.deleteTable();
+    Lineitem.deleteTable();
+    Supplier.deleteTable();
+    SelectedCustomers.deleteTable();
+    SelectedOrders.deleteTable();
+    CustomerItems.deleteTable();
+#else
     auto ItemsBySupplier =
         SelectedNations.inner_join(Supplier, {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}})
             .inner_join(Lineitem, {"[SuppKey]"},
@@ -176,7 +212,6 @@ int main(int argc, char** argv) {
     // Collect garbage
     Customer.deleteTable();
     Orders.deleteTable();
-    size_t L_size = Lineitem.size();
     Lineitem.deleteTable();
 
     auto FinalItems =
@@ -185,6 +220,7 @@ int main(int argc, char** argv) {
 
     ItemsByCustomer.deleteTable();
     ItemsBySupplier.deleteTable();
+#endif
 
     stopwatch::timepoint("Joins");
 

@@ -64,6 +64,16 @@ using T = int64_t;
 
 using sec = duration<float, seconds::period>;
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(lineitem,part),orders),join(join(nation,supplier),partsupp))";
+#else
+constexpr auto TPCH_PLAN_VARIANT = "original-orq";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(join(join(nation,supplier),lineitem),part),orders),partsupp)";
+#endif
+
 int main(int argc, char** argv) {
     orq_init(argc, argv);
     auto pid = runTime->getPartyID();
@@ -95,6 +105,8 @@ int main(int argc, char** argv) {
     using B = BSharedVector<T>;
 
     single_cout("Q9 SF " << db.scaleFactor);
+    single_cout("[QUERY_PLAN] query=q9 variant=" << TPCH_PLAN_VARIANT
+                                                  << " association=" << TPCH_PLAN_ASSOCIATION);
 
     ////////////////////////////////////////////////////////////////
     // Query
@@ -141,6 +153,46 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("Part Filter");
 
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+    // Left branch of DuckDB's canonical association: (Lineitem join Part) join Orders.
+    auto PartLineItemJoin = Part.inner_join(LineItem, {"[PartKey]"}, {});
+    Part.deleteTable();
+    LineItem.deleteTable();
+
+    stopwatch::timepoint("PartKey Join");
+
+    auto LineItemOrderKeyJoin = Orders.inner_join(
+        PartLineItemJoin, {"[OrderKey]"}, {{"[OrderDate]", "[OrderDate]", copy<B>}});
+    Orders.deleteTable();
+    PartLineItemJoin.deleteTable();
+
+    stopwatch::timepoint("OrderKey Join");
+
+    // Right branch: (Nation join Supplier) join PartSupp.
+    Supplier.addColumns({"[NationName]"});
+    auto SuppliersJoin =
+        Nation.inner_join(Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
+    Supplier.deleteTable();
+
+    stopwatch::timepoint("NationKey Join");
+
+    auto SupplierPartSuppJoin = SuppliersJoin.inner_join(
+        PartSupp, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
+    SuppliersJoin.deleteTable();
+    PartSupp.deleteTable();
+
+    stopwatch::timepoint("SuppKey Join");
+
+    // The composite PartSupp key is the primary side for the final ORQ join.
+    auto FinalJoin = SupplierPartSuppJoin.inner_join(
+        LineItemOrderKeyJoin, {"[PartKey]", "[SuppKey]"},
+        {{"SupplyCost", "SupplyCost", copy<A>},
+         {"[NationName]", "[NationName]", copy<B>}});
+    SupplierPartSuppJoin.deleteTable();
+    LineItemOrderKeyJoin.deleteTable();
+
+    stopwatch::timepoint("PartSupp Join");
+#else
     Supplier.addColumns({"[NationName]"});
     auto SuppliersJoin =
         Nation.inner_join(Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
@@ -177,6 +229,7 @@ int main(int argc, char** argv) {
     LineItemOrderKeyJoin.deleteTable();
 
     stopwatch::timepoint("PartSupp Join");
+#endif
 
     FinalJoin.project(
         {"[NationName]", "[OrderDate]", "ExtendedPrice", "Discount", "Quantity", "SupplyCost"});

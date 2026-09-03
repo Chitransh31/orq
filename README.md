@@ -343,11 +343,15 @@ The WAN simulator is very easy to use:
 # Turn on simWAN for node0 (implied), node1, node2, and node3
 $ ../scripts/comm/cluster-wan-sim.sh on node{1,2,3}
 # Run your experiment
-# [Soon, run_experiment will handle running cluster-wan-sim for you]
-$ ../scripts/run_experiment.sh -s wan ...
+# run_experiment.py manages cluster-wan-sim automatically for -s wan
+$ ../scripts/run_experiment.py -s wan ...
 # Disable simWAN
 $ ../scripts/comm/cluster-wan-sim.sh off node{1,2,3}
 ```
+
+Use `--wan-sim off` with `run_experiment.py` when the hosts are already
+geographically distributed and their real network conditions should be left
+unchanged.
 
 This simple script makes some assumptions about the network topology (e.g., that all nodes are routable over the same interface), so modifications may be required for more complex deployments.
 
