@@ -98,16 +98,40 @@ else (MPI_FOUND)
     message(SEND_ERROR "This application cannot compile without MPI")
 endif (MPI_FOUND)
 
-# Using libsodium
-find_path(SODIUM_INCLUDE_DIR sodium.h HINTS ${LIBSODIUM_INCLUDE_DIRS} /usr/local/include /opt/local/include /opt/include)
-find_library(SODIUM_LIBRARY NAMES sodium HINTS ${LIBSODIUM_LIBRARY_DIRS} /usr/local/lib /opt/local/lib /opt/lib)
+set(ORQ_ROOTLESS_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/rootless-deps/sysroot/usr")
 
-# Integrate NTL installed under build/ntl-install
-find_path(NTL_INCLUDE_DIR NAMES NTL/ZZ.h HINTS ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/include)
-find_library(NTL_LIBRARY NAMES ntl HINTS ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/lib ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/lib64)
+# Using libsodium. The setup helpers also build a private copy with libOTe,
+# which permits builds on machines without system-wide development packages.
+find_path(SODIUM_INCLUDE_DIR sodium.h HINTS
+    ${LIBSODIUM_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/libOTe-install/include
+    /usr/local/include /opt/local/include /opt/include)
+find_library(SODIUM_LIBRARY NAMES sodium HINTS
+    ${LIBSODIUM_LIBRARY_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/libOTe-install/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/libOTe-install/lib64
+    /usr/local/lib /opt/local/lib /opt/lib)
 
-# SQLite for TPCH query tests
+# The NTL setup helper installs at the repository root. Keep the historical
+# build/ location as a fallback for existing checkouts.
+find_path(NTL_INCLUDE_DIR NAMES NTL/ZZ.h HINTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ntl-install/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/include)
+find_library(NTL_LIBRARY NAMES ntl HINTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ntl-install/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/ntl-install/lib64
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/lib64)
+
+# SQLite for TPC-H query tests. A rootless package extraction is supported for
+# managed machines where users cannot install development packages with apt.
 find_package(SQLite3)
+if(NOT SQLite3_FOUND AND EXISTS "${ORQ_ROOTLESS_DEPS_DIR}/include/sqlite3.h")
+    set(SQLite3_INCLUDE_DIRS "${ORQ_ROOTLESS_DEPS_DIR}/include")
+    set(SQLite3_LIBRARIES "${ORQ_ROOTLESS_DEPS_DIR}/lib/x86_64-linux-gnu/libsqlite3.a")
+    set(SQLite3_FOUND TRUE)
+    message(STATUS "Using rootless SQLite from ${ORQ_ROOTLESS_DEPS_DIR}")
+endif()
 
 # Base list of link libraries
 set(LINK_LIBRARIES "${MPI_LIBRARIES}" "${SODIUM_LIBRARY}" "${NTL_LIBRARY}")
@@ -185,6 +209,7 @@ function(configure_target _target)
         PUBLIC
             ${SODIUM_INCLUDE_DIR}
             ${NTL_INCLUDE_DIR}
+            ${SQLite3_INCLUDE_DIRS}
             ${CMAKE_SOURCE_DIR}/include)
 
     # message(STATUS "Includes for: ${fileName}")

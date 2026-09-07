@@ -29,6 +29,26 @@ runner = load_module("run_experiment_for_tpch_test", REPO_ROOT / "scripts" / "ru
 
 
 class ReportTests(unittest.TestCase):
+    def test_wan_only_both_plans_excludes_other_modes(self):
+        command = ["bash", str(REPO_ROOT / "scripts/run-tpch-plain-and-3pc.sh"),
+                   "--only-3pc-wan", "--plan-set", "both", "--hosts", "zf01,zf02,zf03", "--dry-run"]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        commands = [shlex.split(line.removeprefix("DRY RUN: ")) for line in result.stdout.splitlines()
+                    if line.startswith("DRY RUN: ")]
+        self.assertEqual(len(commands), 10)
+        for argv in commands:
+            self.assertEqual(argv[argv.index("-p") + 1], "3")
+            self.assertEqual(argv[argv.index("-s") + 1], "wan")
+            self.assertEqual(argv[argv.index("--hosts") + 1], "zf01,zf02,zf03")
+        with tempfile.TemporaryDirectory() as tmp:
+            data = reporter.build_report_data(Path(tmp), 0.1, 16, 3, "node", "simulated",
+                                              plan_set="both", only_3pc_wan=True)
+        self.assertEqual(len(data["runs"]), 10)
+        self.assertEqual(data["benchmark"]["expected_executions"], 30)
+        self.assertTrue(all(run["mode"] == "secure-3pc/wan-simulated" for run in data["runs"]))
+        result = subprocess.run(command + ["--wan-mode", "none"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+
     def test_statistics_and_concatenated_json(self):
         self.assertEqual(reporter.calculate_statistics([1, 2, 3])["median"], 2.0)
         with tempfile.TemporaryDirectory() as tmp:
@@ -137,6 +157,29 @@ P1 Total 400
             markdown = reporter.render_markdown(data)
             self.assertIn("fixed C++ plans", markdown)
             self.assertIn("Observed operator trace", markdown)
+
+    def test_lan_only_report_omits_wan_and_records_explicit_hosts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            stale_wan_dir = output_dir / "secure-3pc" / "wan-simulated"
+            stale_wan_dir.mkdir(parents=True)
+            (stale_wan_dir / "q1.json").write_text("{}", encoding="utf-8")
+            (stale_wan_dir / "q1.log").write_text("stale", encoding="utf-8")
+
+            data = reporter.build_report_data(
+                output_dir,
+                0.1,
+                16,
+                3,
+                "node",
+                "none",
+                hosts=["zf01", "zf02", "zf03"],
+            )
+
+            self.assertEqual(len(data["runs"]), 10)
+            self.assertEqual(data["benchmark"]["expected_executions"], 30)
+            self.assertEqual(data["benchmark"]["hosts"], ["zf01", "zf02", "zf03"])
+            self.assertFalse(any("wan" in run["mode"] for run in data["runs"]))
 
     def test_paired_report_computes_speedup_and_communication_ratio(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,9 +297,24 @@ class WanSimulationTests(unittest.TestCase):
                 runner, "_run_cmd", side_effect=["10.0.0.2 via 10.0.0.1 dev eth0", "10.0.0.1/24"]
             ),
         ):
-            interface, subnet = runner.discover_iface_and_subnet("node")
+            interface, subnet = runner.discover_iface_and_subnet("node1")
         resolve.assert_called_once_with("node1")
         self.assertEqual((interface, subnet), ("eth0", "10.0.0.1/24"))
+
+    def test_explicit_hosts_are_used_for_distributed_nocopy(self):
+        args = runner.build_parser().parse_args([
+            "-p", "3", "-s", "lan", "-c", "nocopy", "-f", "0.1",
+            "--hosts", "zf01,zf02,zf03", "q1",
+        ])
+        with (
+            mock.patch.object(runner, "discover_iface_and_subnet", return_value=("eth0", "10.0.21.61/24")) as discover,
+            mock.patch.object(runner, "_get_git_info", return_value=("abc123", "main", "")),
+        ):
+            cfg = runner.derive_config(args)
+
+        discover.assert_called_once_with("zf02")
+        self.assertEqual(cfg.hosts, ["zf01", "zf02", "zf03"])
+        self.assertIsNone(cfg.node_prefix)
 
     def test_wan_sim_choice_is_recorded_in_run_configuration(self):
         args = runner.build_parser().parse_args([
@@ -356,6 +414,30 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(sum(protocol == "3" and setting == "wan" for protocol, setting, _ in matrix), 5)
         self.assertFalse(any(protocol == "1" and setting != "same" for protocol, setting, _ in matrix))
 
+    def test_lan_only_dry_run_uses_explicit_hosts_and_has_no_wan(self):
+        script = REPO_ROOT / "scripts" / "run-tpch-plain-and-3pc.sh"
+        completed = subprocess.run(
+            [
+                "bash", str(script), "--dry-run", "--wan-mode", "none",
+                "--hosts", "zf01,zf02,zf03",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        commands = [
+            shlex.split(line.removeprefix("DRY RUN:"))
+            for line in completed.stdout.splitlines() if line.startswith("DRY RUN:")
+        ]
+
+        self.assertEqual(len(commands), 10)
+        self.assertFalse(any(command[command.index("-s") + 1] == "wan" for command in commands))
+        distributed = [command for command in commands if command[command.index("-p") + 1] == "3"]
+        self.assertEqual(len(distributed), 5)
+        self.assertTrue(all("--hosts" in command for command in distributed))
+        self.assertTrue(all(command[command.index("--hosts") + 1] == "zf01,zf02,zf03" for command in distributed))
+
     def test_both_plan_set_has_30_groups_and_seeded_duckdb_targets(self):
         script = REPO_ROOT / "scripts" / "run-tpch-plain-and-3pc.sh"
         with tempfile.TemporaryDirectory() as tmp:
@@ -375,7 +457,7 @@ class DryRunTests(unittest.TestCase):
         ]
         self.assertEqual(len(commands), 30)
         self.assertEqual(sum(command[-1].endswith("_duckdb") for command in commands), 15)
-        self.assertTrue(all("-a=--tpch-seed=42" in command for command in commands))
+        self.assertTrue(all("-a=-tpch-seed 42" in command for command in commands))
         self.assertEqual(
             sum(command[command.index("-p") + 1] == "1" for command in commands), 10
         )

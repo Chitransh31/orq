@@ -12,16 +12,19 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 INVOCATION_DIR="$(pwd -P)"
 REPORTER="$SCRIPT_DIR/report_tpch_plain_and_3pc.py"
 RUNNER="$SCRIPT_DIR/run_experiment.py"
+export PATH="$HOME/bin:$PATH"
 
 SCALE_FACTOR="${SCALE_FACTOR:-0.1}"
 THREADS="${THREADS:-16}"
 REPETITIONS="${REPETITIONS:-3}"
 NODE_PREFIX="${NODE_PREFIX:-node}"
+HOSTS="${HOSTS:-}"
 WAN_MODE="${WAN_MODE:-simulated}"
 PLAN_SET="${PLAN_SET:-original}"
 DATA_SEED="${DATA_SEED:-20260818}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 DRY_RUN=0
+ONLY_3PC_WAN=0
 QUERIES=(1 3 5 8 9)
 
 usage() {
@@ -38,7 +41,10 @@ Options:
   --threads N            Worker threads per party (default: 16)
   --repetitions N        Runs per query/mode (default: 3)
   --node-prefix PREFIX   Hosts are PREFIX0, PREFIX1, PREFIX2 (default: node)
-  --wan-mode MODE        simulated or real (default: simulated)
+  --hosts HOST1,HOST2,HOST3
+                         Explicit party hosts; overrides --node-prefix
+  --wan-mode MODE        simulated, userspace, real, or none (default: simulated)
+  --only-3pc-wan        Run only secure 3PC WAN (omit plaintext and LAN)
   --plan-set SET         original, duckdb-canonical, or both (default: original)
   --data-seed UINT64     Deterministic synthetic-data seed (default: 20260818)
   --output-dir PATH      Result directory (default: timestamped under results/)
@@ -79,10 +85,19 @@ while [[ $# -gt 0 ]]; do
             NODE_PREFIX="$2"
             shift 2
             ;;
+        --hosts)
+            need_value "$@"
+            HOSTS="$2"
+            shift 2
+            ;;
         --wan-mode)
             need_value "$@"
             WAN_MODE="$2"
             shift 2
+            ;;
+        --only-3pc-wan)
+            ONLY_3PC_WAN=1
+            shift
             ;;
         --plan-set)
             need_value "$@"
@@ -127,10 +142,32 @@ if ! [[ "$NODE_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "--node-prefix must contain only letters, digits, '.', '_', or '-'" >&2
     exit 2
 fi
-if [[ "$WAN_MODE" != "simulated" && "$WAN_MODE" != "real" ]]; then
-    echo "--wan-mode must be simulated or real (got: $WAN_MODE)" >&2
+if [[ "$WAN_MODE" != "simulated" && "$WAN_MODE" != "real" && "$WAN_MODE" != "none" && "$WAN_MODE" != "userspace" ]]; then
+    echo "--wan-mode must be simulated, userspace, real, or none (got: $WAN_MODE)" >&2
     exit 2
 fi
+
+if [[ "$ONLY_3PC_WAN" -eq 1 && "$WAN_MODE" == "none" ]]; then
+    echo "--only-3pc-wan requires --wan-mode simulated, userspace, or real" >&2
+    exit 2
+fi
+
+if [[ -n "$HOSTS" ]]; then
+    IFS=',' read -r -a PARTY_HOSTS <<< "$HOSTS"
+    if [[ "${#PARTY_HOSTS[@]}" -ne 3 ]]; then
+        echo "--hosts must contain exactly three comma-separated hosts (got: $HOSTS)" >&2
+        exit 2
+    fi
+    for node in "${PARTY_HOSTS[@]}"; do
+        if ! [[ "$node" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid host in --hosts: $node" >&2
+            exit 2
+        fi
+    done
+else
+    PARTY_HOSTS=("${NODE_PREFIX}0" "${NODE_PREFIX}1" "${NODE_PREFIX}2")
+fi
+PEER_HOSTS=("${PARTY_HOSTS[@]:1}")
 if [[ "$PLAN_SET" != "original" && "$PLAN_SET" != "duckdb-canonical" && "$PLAN_SET" != "both" ]]; then
     echo "--plan-set must be original, duckdb-canonical, or both (got: $PLAN_SET)" >&2
     exit 2
@@ -208,15 +245,19 @@ run_mode() {
                 -f "$SCALE_FACTOR"
                 -T "$THREADS"
                 -b "$batch_size"
-                -x "$NODE_PREFIX"
                 -m="$CMAKE_EXTRA"
-                "-a=--tpch-seed=$DATA_SEED"
+                "-a=-tpch-seed $DATA_SEED"
             )
+            if [[ "$protocol" -gt 1 && -n "$HOSTS" ]]; then
+                command+=( --hosts "$HOSTS" )
+            else
+                command+=( -x "$NODE_PREFIX" )
+            fi
             if [[ "$communicator" == "nocopy" ]]; then
                 command+=( -n "$comm_threads" )
             fi
-            if [[ "$wan_sim" == "off" ]]; then
-                command+=( --wan-sim off )
+            if [[ "$wan_sim" != "auto" ]]; then
+                command+=( --wan-sim "$wan_sim" )
             fi
             command+=( "$target_name" )
 
@@ -250,11 +291,15 @@ run_mode() {
 }
 
 run_matrix() {
-    run_mode "plaintext-1pc/same" 1 same mpi 0 -12 off
-    run_mode "secure-3pc/lan" 3 lan nocopy 4 -12 off
+    if [[ "$ONLY_3PC_WAN" -eq 0 ]]; then
+        run_mode "plaintext-1pc/same" 1 same mpi 0 -12 off
+        run_mode "secure-3pc/lan" 3 lan nocopy 4 -12 off
+    fi
     if [[ "$WAN_MODE" == "simulated" ]]; then
         run_mode "secure-3pc/wan-simulated" 3 wan nocopy -1 -1 auto
-    else
+    elif [[ "$WAN_MODE" == "userspace" ]]; then
+        run_mode "secure-3pc/wan-userspace" 3 wan nocopy -1 -1 userspace-distributed
+    elif [[ "$WAN_MODE" == "real" ]]; then
         run_mode "secure-3pc/wan-real" 3 wan nocopy -1 -1 off
     fi
 }
@@ -295,7 +340,7 @@ preflight() {
     printf -v remote_repo_q '%q' "$REPO_ROOT"
     printf -v remote_build_q '%q' "$REPO_ROOT/build"
     local node
-    for node in "${NODE_PREFIX}0" "${NODE_PREFIX}1" "${NODE_PREFIX}2"; do
+    for node in "${PARTY_HOSTS[@]}"; do
         getent hosts "$node" >/dev/null || {
             echo "Host $node does not resolve. Configure DNS or /etc/hosts first." >&2
             exit 1
@@ -319,7 +364,7 @@ preflight() {
             echo "Simulated WAN requires passwordless sudo on node0." >&2
             exit 1
         }
-        for node in "${NODE_PREFIX}1" "${NODE_PREFIX}2"; do
+        for node in "${PEER_HOSTS[@]}"; do
             ssh -o BatchMode=yes "$node" 'command -v python3 >/dev/null && command -v ip >/dev/null && command -v tc >/dev/null && sudo -n true' || {
                 echo "Simulated WAN requires Python 3, ip, tc, and passwordless sudo on $node." >&2
                 exit 1
@@ -335,13 +380,19 @@ write_metadata() {
         echo "Threads per party: $THREADS"
         echo "Repetitions: $REPETITIONS"
         echo "Node prefix: $NODE_PREFIX"
+        echo "Party hosts: ${PARTY_HOSTS[*]}"
         echo "WAN mode: $WAN_MODE"
         echo "Plan set: $PLAN_SET"
+        echo "Only 3PC WAN: $ONLY_3PC_WAN"
         echo "TPC-H data seed: $DATA_SEED"
         if [[ "$WAN_MODE" == "simulated" ]]; then
             echo "WAN simulator: 12 Gbit/s, 6.5 ms one-way delay (approximately 13 ms RTT)"
-        else
+        elif [[ "$WAN_MODE" == "userspace" ]]; then
+            echo "WAN simulator: userspace TCP relay, 6.5 ms/direction, 12 Gbit/s application cap per directed link; qualitative"
+        elif [[ "$WAN_MODE" == "real" ]]; then
             echo "WAN simulator: disabled; host network conditions are used unchanged"
+        else
+            echo "WAN benchmark: omitted (plaintext and LAN only)"
         fi
         echo "Generated: $(date --iso-8601=seconds)"
         echo "Git commit: $(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -355,12 +406,12 @@ write_metadata() {
         echo
         echo "Initial server-to-server RTT from coordinator:"
         local node
-        for node in "${NODE_PREFIX}1" "${NODE_PREFIX}2"; do
+        for node in "${PEER_HOSTS[@]}"; do
             ping -q -c 3 "$node" 2>&1 || true
         done
         echo
         echo "Remote nodes:"
-        for node in "${NODE_PREFIX}0" "${NODE_PREFIX}1" "${NODE_PREFIX}2"; do
+        for node in "${PARTY_HOSTS[@]}"; do
             echo "[$node]"
             ssh -o BatchMode=yes "$node" 'hostname; uname -srmo; command -v nproc >/dev/null && nproc' 2>&1 || true
         done
@@ -370,7 +421,7 @@ write_metadata() {
 cleanup_wan_after_signal() {
     if [[ "$WAN_MODE" == "simulated" ]]; then
         echo "Interrupted; attempting to remove WAN traffic shaping." >&2
-        "$SCRIPT_DIR/comm/cluster-wan-sim.sh" off "${NODE_PREFIX}1" "${NODE_PREFIX}2" || true
+        "$SCRIPT_DIR/comm/cluster-wan-sim.sh" off "${PEER_HOSTS[@]}" || true
     fi
 }
 
@@ -378,8 +429,8 @@ trap 'cleanup_wan_after_signal; exit 130' INT TERM
 
 preflight
 if [[ "$WAN_MODE" == "simulated" ]]; then
-    echo "Removing any stale WAN traffic shaping before the 3PC LAN baseline."
-    "$SCRIPT_DIR/comm/cluster-wan-sim.sh" off "${NODE_PREFIX}1" "${NODE_PREFIX}2"
+    echo "Removing any stale WAN traffic shaping before the selected benchmarks."
+    "$SCRIPT_DIR/comm/cluster-wan-sim.sh" off "${PEER_HOSTS[@]}"
 fi
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd)"
@@ -387,15 +438,24 @@ write_metadata
 run_matrix
 
 set +e
-python3 "$REPORTER" \
-    --output-dir "$OUTPUT_DIR" \
-    --scale-factor "$SCALE_FACTOR" \
-    --threads "$THREADS" \
-    --repetitions "$REPETITIONS" \
-    --node-prefix "$NODE_PREFIX" \
-    --wan-mode "$WAN_MODE" \
-    --plan-set "$PLAN_SET" \
+report_command=(
+    python3 "$REPORTER"
+    --output-dir "$OUTPUT_DIR"
+    --scale-factor "$SCALE_FACTOR"
+    --threads "$THREADS"
+    --repetitions "$REPETITIONS"
+    --node-prefix "$NODE_PREFIX"
+    --wan-mode "$WAN_MODE"
+    --plan-set "$PLAN_SET"
     --data-seed "$DATA_SEED"
+)
+if [[ -n "$HOSTS" ]]; then
+    report_command+=( --hosts "$HOSTS" )
+fi
+if [[ "$ONLY_3PC_WAN" -eq 1 ]]; then
+    report_command+=( --only-3pc-wan )
+fi
+"${report_command[@]}"
 REPORT_STATUS=$?
 set -e
 

@@ -251,9 +251,15 @@ def parse_log(text: str) -> dict[str, Any]:
     communicator_samples: dict[str, list[int]] = defaultdict(list)
     rtt_samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     plan_markers: list[dict[str, str | None]] = []
+    userspace_relays: list[dict[str, Any]] = []
     rtt_section: str | None = None
 
     for line in text.splitlines():
+        if line.startswith("[USERSPACE_WAN] "):
+            try:
+                userspace_relays.append(json.loads(line[len("[USERSPACE_WAN] "):]))
+            except json.JSONDecodeError:
+                userspace_relays.append({"errors": ["invalid relay diagnostic JSON"]})
         if re.search(r"\[=SW\]\s+Start\s*$", line):
             repetition += 1
 
@@ -307,6 +313,7 @@ def parse_log(text: str) -> dict[str, Any]:
             for section, hosts in sorted(rtt_samples.items())
         },
         "query_plan_markers": plan_markers,
+        "userspace_relays": userspace_relays,
     }
 
 
@@ -346,14 +353,32 @@ def _artifact_identity(name: str) -> tuple[str, str]:
     return name, "original"
 
 
+def _expected_modes(wan_mode: str, only_3pc_wan: bool = False) -> tuple[Path, ...]:
+    if only_3pc_wan and wan_mode == "none":
+        raise ValueError("WAN-only reporting requires simulated, userspace or real WAN")
+    modes = [] if only_3pc_wan else [Path("plaintext-1pc/same"), Path("secure-3pc/lan")]
+    if wan_mode != "none":
+        modes.append(Path(f"secure-3pc/wan-{wan_mode}"))
+    return tuple(modes)
+
+
 def _find_run_files(
-    output_dir: Path, wan_mode: str, plan_set: str
+    output_dir: Path, wan_mode: str, plan_set: str, only_3pc_wan: bool = False
 ) -> Iterator[tuple[Path, Path, Path]]:
     selected_variants = set(PLAN_SET_VARIANTS[plan_set])
+    expected_modes = _expected_modes(wan_mode, only_3pc_wan)
 
     def selected(path: Path) -> bool:
         query, variant = _artifact_identity(path.stem)
-        return query in QUERY_PLANS and variant in selected_variants
+        try:
+            relative_parent = path.parent.relative_to(output_dir)
+        except ValueError:
+            return False
+        return (
+            relative_parent in expected_modes
+            and query in QUERY_PLANS
+            and variant in selected_variants
+        )
 
     json_files = {
         path.with_suffix("") for path in output_dir.rglob("q*.json") if selected(path)
@@ -361,11 +386,6 @@ def _find_run_files(
     log_files = {
         path.with_suffix("") for path in output_dir.rglob("q*.log") if selected(path)
     }
-    expected_modes = (
-        Path("plaintext-1pc/same"),
-        Path("secure-3pc/lan"),
-        Path(f"secure-3pc/wan-{wan_mode}"),
-    )
     expected_files = {
         output_dir / mode / _artifact_name(query, variant)
         for mode in expected_modes
@@ -380,7 +400,12 @@ def _configured_data_seed(config: dict[str, Any]) -> int | None:
     args = config.get("exp_args", [])
     if not isinstance(args, list):
         return None
-    for arg in args:
+    for index, arg in enumerate(args):
+        if arg in ("-tpch-seed", "-z") and index + 1 < len(args):
+            try:
+                return int(args[index + 1])
+            except (ValueError, TypeError):
+                return None
         if isinstance(arg, str) and arg.startswith("--tpch-seed="):
             try:
                 return int(arg.split("=", 1)[1])
@@ -398,12 +423,14 @@ def build_report_data(
     wan_mode: str,
     plan_set: str = "original",
     data_seed: int = 20260818,
+    hosts: list[str] | None = None,
+    only_3pc_wan: bool = False,
 ) -> dict[str, Any]:
     runs: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     plan_catalog = load_plan_catalog()
 
-    for stem, json_path, log_path in _find_run_files(output_dir, wan_mode, plan_set):
+    for stem, json_path, log_path in _find_run_files(output_dir, wan_mode, plan_set, only_3pc_wan):
         query, variant = _artifact_identity(stem.name)
         relative_parent = stem.parent.relative_to(output_dir)
         mode = str(relative_parent)
@@ -446,6 +473,19 @@ def build_report_data(
                 issues.append(
                     f"simulated-WAN RTT did not increase ({baseline:.3f} ms to {simulated:.3f} ms)"
                 )
+
+        if mode == "secure-3pc/wan-userspace":
+            relays = log_data.get("userspace_relays", [])
+            if any(item.get("errors") for item in relays):
+                issues.append("userspace relay reported errors")
+            for rank in range(3):
+                observations = [item for item in relays if item.get("rank") == rank]
+                if len(observations) != repetitions:
+                    issues.append(f"expected {repetitions} relay diagnostics for party {rank}, found {len(observations)}")
+                if rank < 2 and any(item.get("bytes", 0) <= 0 or item.get("connections", 0) <= 0 for item in observations):
+                    issues.append(f"party {rank} has no observed relayed traffic")
+            if config.get("wan_sim") != "userspace-distributed":
+                issues.append("profile does not identify userspace WAN mode")
 
         overall_count = stage_statistics.get("Overall", {}).get("count", 0)
         if overall_count != repetitions:
@@ -533,12 +573,17 @@ def build_report_data(
             "plan_variants": list(PLAN_SET_VARIANTS[plan_set]),
             "data_seed": data_seed,
             "expected_executions": (
-                len(QUERY_PLANS) * len(PLAN_SET_VARIANTS[plan_set]) * 3 * repetitions
+                len(QUERY_PLANS)
+                * len(PLAN_SET_VARIANTS[plan_set])
+                * len(_expected_modes(wan_mode, only_3pc_wan))
+                * repetitions
             ),
             "profiled_executions": profiled_executions,
             "successful_executions": successful_executions,
             "node_prefix": node_prefix,
+            "hosts": hosts or [f"{node_prefix}{index}" for index in range(3)],
             "wan_mode": wan_mode,
+            "only_3pc_wan": only_3pc_wan,
         },
         "plan_kind": (
             "Fixed handwritten original ORQ plans and ORQ-compatible translations of frozen "
@@ -596,7 +641,7 @@ def build_comparisons(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
             runtime_delta_percent = (
                 round(runtime_delta / float(original_mean) * 100, 6)
-                if runtime_delta is not None and float(original_mean) != 0
+                if runtime_delta is not None and original_mean is not None and float(original_mean) != 0
                 else None
             )
             communication_delta = (
@@ -669,6 +714,12 @@ def render_markdown(data: dict[str, Any]) -> str:
         "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
 
+    if benchmark["wan_mode"] == "userspace":
+        lines[2:2] = [
+            "> WAN simulation uses no-sudo TCP relays: 6.5 ms per direction and a 12 Gbit/s "
+            "application-byte cap per directed party link. This is a qualitative application-traffic "
+            "simulation, not kernel packet shaping or a guarantee of 12 Gbit/s throughput. "
+            "TCP ACKs and ping are not delayed. Per-party relay byte counters are in results.json.", ""]
     for run in data["runs"]:
         overall = run["stage_statistics_seconds"].get("Overall", {})
         byte_total = _mean_total_bytes(run)
@@ -851,8 +902,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale-factor", required=True, type=float)
     parser.add_argument("--threads", required=True, type=int)
     parser.add_argument("--repetitions", required=True, type=int)
-    parser.add_argument("--node-prefix", required=True)
-    parser.add_argument("--wan-mode", required=True, choices=["simulated", "real"])
+    parser.add_argument("--node-prefix", default="node")
+    parser.add_argument("--hosts")
+    parser.add_argument("--only-3pc-wan", action="store_true")
+    parser.add_argument("--wan-mode", required=True, choices=["simulated", "userspace", "real", "none"])
     parser.add_argument(
         "--plan-set",
         choices=["original", "duckdb-canonical", "both"],
@@ -867,6 +920,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not 0 <= args.data_seed <= (2**64 - 1):
         parser.error("--data-seed must be an unsigned 64-bit integer")
+    if args.only_3pc_wan and args.wan_mode == "none":
+        parser.error("--only-3pc-wan requires simulated, userspace or real WAN")
     data = build_report_data(
         output_dir=args.output_dir,
         scale_factor=args.scale_factor,
@@ -876,6 +931,8 @@ def main(argv: list[str] | None = None) -> int:
         wan_mode=args.wan_mode,
         plan_set=args.plan_set,
         data_seed=args.data_seed,
+        hosts=args.hosts.split(",") if args.hosts else None,
+        only_3pc_wan=args.only_3pc_wan,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "plans.json").write_text(

@@ -14,6 +14,9 @@ from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rootless_wan
+
 SLEEP_BETWEEN_REPS_SEC = 30
 STOPWATCH_FILENAME = ".experiment.json"
 AGG_OUTPUT_FILENAME = "output.json"
@@ -74,6 +77,14 @@ def parse_input_sizes(arg: str) -> List[int]:
     return values
 
 
+def parse_hosts(arg: str) -> List[str]:
+    """Parse a comma-separated list of explicit hostnames."""
+    hosts = [host.strip() for host in arg.split(",")]
+    if not hosts or any(not host for host in hosts):
+        raise argparse.ArgumentTypeError("Host list must contain non-empty comma-separated hosts")
+    return hosts
+
+
 def parse_thread_pow_range(arg: str) -> Tuple[int, int]:
     """
     Parse 'min[-max]' integer pattern into (min, max) powers of two.
@@ -110,7 +121,8 @@ class ExperimentConfig:
     triples_type: str
     cmake_args: List[str]
     exp_args: List[str]
-    node_prefix: str
+    node_prefix: Optional[str]
+    hosts: List[str]
     batch_size: int
     exp_name: str
     # Derived values
@@ -127,6 +139,9 @@ class ExperimentConfig:
     git_commit: Optional[str]
     git_branch: Optional[str]
     git_status_porcelain: Optional[str]
+    rootless: Optional[dict] = None
+    rootless_invocation: Optional[dict] = None
+    userspace_wan: Optional[dict] = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,13 +179,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wan-sim",
         dest="wan_sim",
-        choices=["auto", "off"],
+        choices=["auto", "off", "rootless-local", "userspace-distributed"],
         default="auto",
         help=(
             "WAN traffic shaping; 'auto' manages scripts/comm/cluster-wan-sim.sh "
-            "for -s wan, while 'off' leaves the network untouched; default: auto"
+            "for -s wan; 'off' leaves networking untouched; 'rootless-local' "
+            "shapes private loopback for -p 3 -s same -c nocopy; default: auto"
         ),
     )
+    parser.add_argument("--wan-latency-ms", type=float, default=None)
+    parser.add_argument("--wan-bandwidth-gbps", type=float, default=None)
+    parser.add_argument("--wan-loopback-mtu", type=int, default=None)
+    parser.add_argument("--wan-queue-limit-packets", type=int, default=None)
+    parser.add_argument("--wan-sim-check", action="store_true")
     parser.add_argument(
         "-c",
         dest="exp_communicator",
@@ -232,11 +253,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Pass additional arguments to the experiment binary (can be repeated for more)",
     )
-    parser.add_argument(
+    host_group = parser.add_mutually_exclusive_group()
+    host_group.add_argument(
         "-x",
+        "--node-prefix",
         dest="node_prefix",
         default="node",
         help="Prefix for remote nodes. Machines are prefix0, prefix1, ...; default: node",
+    )
+    host_group.add_argument(
+        "--hosts",
+        type=parse_hosts,
+        default=None,
+        help="Explicit comma-separated host list, for example zf01,zf02,zf03",
     )
     parser.add_argument(
         "-b",
@@ -286,14 +315,11 @@ def _extract_iface_from_ip_route(route_output: str) -> Optional[str]:
     m = re.search(r"\bdev\s+(\S+)", route_output)
     return m.group(1) if m else None
 
-def discover_iface_and_subnet(node_prefix: str) -> Tuple[Optional[str], Optional[str]]:
+def discover_iface_and_subnet(node: str) -> Tuple[Optional[str], Optional[str]]:
     r"""
-    Replicate the bash logic:
-      _node=${node_prefix}1
-      Resolve ${_node} with the system resolver, then inspect its route.
-      SUBNET=$(ip -o -f inet addr show ${iface} | awk '{print $4}')
+    Resolve a peer host with the system resolver, inspect its route, and return
+    the route interface and that interface's IPv4 subnet.
     """
-    node = f"{node_prefix}1"
     try:
         ip_candidate = socket.gethostbyname(node)
     except socket.gaierror:
@@ -308,6 +334,41 @@ def discover_iface_and_subnet(node_prefix: str) -> Tuple[Optional[str], Optional
 
 
 def derive_config(args: argparse.Namespace) -> ExperimentConfig:
+    # Validate before remote discovery, compilation, or any network changes.
+    rootless = None
+    userspace_wan = None
+    invocation = None
+    try:
+        physical = rootless_wan.profile(args)
+        if args.wan_sim == "userspace-distributed":
+            if (args.exp_protocol, args.exp_setting, args.exp_communicator or "nocopy") != (3, "wan", "nocopy"):
+                raise ValueError("userspace-distributed requires -p 3 -s wan -c nocopy")
+            binary = _flatten_args(args.exp_args)
+            hints = rootless_wan.validate_effective(_flatten_args(args.cmake_args), binary,
+                {"latency_ms": 6.5, "bandwidth_gbps": 12}, Path.cwd().parent / "build", setting="wan")
+            args.exp_args = [shlex.join(binary)]
+            userspace_wan = {"delay_ms_per_direction": 6.5, "application_cap_gbps_per_directed_link": 12,
+                             "transport": "TCP application-byte relay", "qualitative": True, "cost_model": hints}
+
+        if physical is not None:
+            binary = _flatten_args(args.exp_args)
+            hints = rootless_wan.validate_effective(
+                _flatten_args(args.cmake_args), binary, physical, Path.cwd().parent / "build")
+            args.exp_args = [shlex.join(binary)]
+            rootless = {"requested_mode": "rootless-local", "topology": "single-host-three-local-parties",
+                        "physical": physical, "cost_model": hints, "managed_shaping": False}
+            if rootless_wan.CONTEXT in os.environ:
+                context = json.loads(os.environ[rootless_wan.CONTEXT])
+                current = rootless_wan.verify_namespaces(context["outer"])
+                if current != context["inner"] or physical != context["physical"] or args.wan_sim_check:
+                    raise ValueError("Inconsistent managed rootless namespace context")
+                rootless.update(managed_shaping=True, actual=context["actual"])
+                invocation = context["invocation"]
+        elif rootless_wan.CONTEXT in os.environ:
+            raise ValueError("Managed namespace context requires --wan-sim rootless-local")
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        raise SystemExit(f"Error: {exc}") from exc
+
     # Validate scale factor
     use_scale_factor = args.scale_factor is not None
     if use_scale_factor and not (args.scale_factor > 0):
@@ -353,11 +414,29 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
     # Map communicator to cmake arg
     comm_cmake_arg = "MPI" if exp_communicator == "mpi" else "NOCOPY"
 
+    # Resolve either an explicit host list or the legacy prefix-generated list.
+    explicit_hosts = args.hosts is not None
+    node_prefix: Optional[str] = None if explicit_hosts else args.node_prefix
+    hosts = (
+        list(args.hosts)
+        if explicit_hosts
+        else [f"{args.node_prefix}{i}" for i in range(num_parties)]
+    )
+    if args.exp_setting != "same" and explicit_hosts and len(hosts) != num_parties:
+        raise SystemExit(
+            f"Error: Expected {num_parties} hosts for {num_parties} parties, got {len(hosts)}."
+        )
+
     # Network interface & subnet (only for non-'same' settings)
     iface: Optional[str] = None
     subnet: Optional[str] = None
     if args.exp_setting != "same":
-        iface, subnet = discover_iface_and_subnet(args.node_prefix)
+        # Preserve the legacy 1PC/non-same lookup of prefix1; explicit 1PC has no peer.
+        discovery_host = hosts[1] if len(hosts) > 1 else None
+        if discovery_host is None and node_prefix is not None:
+            discovery_host = f"{node_prefix}1"
+        if discovery_host is not None:
+            iface, subnet = discover_iface_and_subnet(discovery_host)
         if iface and subnet:
             print(f"Common interface: {iface}; subnet {subnet}")
 
@@ -372,7 +451,11 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         num_process_flag = "-n"
         host_flag = "--host"
     elif exp_communicator == "nocopy":
-        run_cmd = "startmpc"
+        run_cmd = (shlex.quote(str(Path(__file__).resolve().parents[1] /
+                   "include/backend/nocopy_communicator/startmpc/startmpc"))
+                   if rootless else "startmpc")
+        if userspace_wan:
+            run_cmd = shlex.join([sys.executable, str(Path(__file__).resolve().parent / "comm/userspace-wan.py")])
         num_process_flag = "-n"
         host_flag = "-h"
     else:
@@ -404,7 +487,8 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         triples_type=triples_type,
         cmake_args=args.cmake_args or [],
         exp_args=args.exp_args or [],
-        node_prefix=args.node_prefix,
+        node_prefix=node_prefix,
+        hosts=hosts,
         batch_size=args.batch_size,
         exp_name=args.exp_name,
         exp_input_sizes=exp_input_sizes,
@@ -420,6 +504,9 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         git_commit=git_commit,
         git_branch=git_branch,
         git_status_porcelain=git_status_porcelain,
+        rootless=rootless,
+        rootless_invocation=invocation,
+        userspace_wan=userspace_wan,
     )
 
 
@@ -429,10 +516,18 @@ def _flatten_args(args_list: List[str]) -> List[str]:
     """
     flat: List[str] = []
     for item in args_list:
-        if not item:
-            continue
         flat.extend(shlex.split(item))
     return flat
+
+
+def _mpi_runtime_library_dir() -> Optional[str]:
+    """Return the directory containing the MPI library selected by mpicxx."""
+    libdirs = _run_cmd(["mpicxx", "--showme:libdirs"])
+    for directory in shlex.split(libdirs):
+        candidate = Path(directory) / "libmpi.so"
+        if candidate.exists():
+            return str(candidate.resolve().parent)
+    return None
 
 
 def perform_experiment_setup(cfg: ExperimentConfig) -> None:
@@ -463,6 +558,13 @@ def perform_experiment_setup(cfg: ExperimentConfig) -> None:
     if res.returncode != 0:
         raise SystemExit(res.returncode)
 
+    if cfg.rootless or cfg.userspace_wan:
+        cache = Path(build_dir, "CMakeCache.txt").read_text()
+        for key, expected in (("PROTOCOL", "3"), ("COMM", "NOCOPY")):
+            values = re.findall(rf"^{key}:[^=]+=(.*)$", cache, re.MULTILINE)
+            if values != [expected]:
+                raise SystemExit(f"Rootless build requires {key}={expected}; configured cache contains {values}")
+
     # Run make
     make_cmd = ["make", "-j", cfg.exp_name]
     res = subprocess.run(make_cmd, cwd=build_dir)
@@ -473,8 +575,7 @@ def perform_experiment_setup(cfg: ExperimentConfig) -> None:
     if cfg.exp_setting != "same":
         local_bin = os.path.join(build_dir, cfg.exp_name)
         remote_dir = os.path.join(cwd, "..", "build")
-        for i in range(1, cfg.num_parties):
-            host = f"{cfg.node_prefix}{i}"
+        for host in cfg.hosts[1:cfg.num_parties]:
             dest = f"{host}:{remote_dir}"
             res = subprocess.run(["scp", "-o", "StrictHostKeyChecking=no", local_bin, dest])
             if res.returncode != 0:
@@ -489,8 +590,7 @@ def perform_experiment_setup(cfg: ExperimentConfig) -> None:
     if cfg.num_parties > 1:
         exp_cmd_prefix = f"{cfg.run_cmd} {cfg.num_process_flag} {cfg.num_parties}"
         if cfg.exp_setting != "same":
-            # host list node0,...,node{num_parties-1}
-            hosts = ",".join([f"{cfg.node_prefix}{i}" for i in range(0, cfg.num_parties)])
+            hosts = ",".join(cfg.hosts[:cfg.num_parties])
             exp_cmd_prefix = f"{exp_cmd_prefix} {cfg.host_flag} {hosts}"
     else:
         if cfg.exp_setting != "same":
@@ -510,9 +610,11 @@ def run_experiments(cfg: ExperimentConfig) -> None:
     exp_args_flat = _flatten_args(cfg.exp_args)
     prefix_parts = shlex.split(cfg.exp_cmd_prefix) if cfg.exp_cmd_prefix else []
     experiment_records: List[dict] = []
+    failed = False
 
     for input_size in cfg.exp_input_sizes:
         if cfg.use_scale_factor:
+            assert cfg.scale_factor is not None
             exp_input = cfg.scale_factor
             input_suffix = "SF"
         else:
@@ -520,14 +622,21 @@ def run_experiments(cfg: ExperimentConfig) -> None:
             exp_input = int(input_size)
             input_suffix = "rows"
 
-        # Build base flagged command for the binary
-        base_cmd = [
+        # Build the binary command. Pin the MPI runtime selected by mpicxx because
+        # managed clusters may expose an incompatible MPI through ldconfig.
+        base_cmd: List[str] = []
+        mpi_runtime_dir = _mpi_runtime_library_dir()
+        if mpi_runtime_dir:
+            base_cmd.extend(["env", f"LD_LIBRARY_PATH={mpi_runtime_dir}"])
+        base_cmd.extend([
             f"./{cfg.exp_name}",
             "-b", str(cfg.batch_size),
             "-r", str(exp_input),
             "-s", cfg.exp_setting,
-            "-x", cfg.node_prefix,
-        ] + exp_args_flat
+        ])
+        if cfg.node_prefix is not None:
+            base_cmd.extend(["-x", cfg.node_prefix])
+        base_cmd += exp_args_flat
 
         # Build list of thread counts to run (powers of two when threads==0)
         threads_to_run = [1 << e for e in range(cfg.min_threads_pow, cfg.max_threads_pow + 1)] if cfg.threads == 0 else [cfg.threads]
@@ -540,6 +649,7 @@ def run_experiments(cfg: ExperimentConfig) -> None:
                 _clear_stopwatch_file(cfg.build_dir)
                 res = subprocess.run(full_cmd, cwd=cfg.build_dir)
                 if res.returncode != 0:
+                    failed = True
                     print("Returned non-zero exit code", res.returncode)
 
                 stopwatch_obj = _read_stopwatch_file(cfg.build_dir)
@@ -558,7 +668,12 @@ def run_experiments(cfg: ExperimentConfig) -> None:
                 time.sleep(1)
 
     grouped = _group_experiment_records(experiment_records)
+    if cfg.rootless_invocation:
+        for record in grouped:
+            record["rootless_invocation"] = cfg.rootless_invocation
     _write_experiment_json(cfg.build_dir, grouped)
+    if failed:
+        raise SystemExit(1)
 
 
 def _select_run_config(
@@ -570,6 +685,8 @@ def _select_run_config(
     cmd: List[str],
 ) -> dict:
     return {
+        **({"rootless": cfg.rootless} if cfg.rootless else {}),
+        **({"userspace_wan": cfg.userspace_wan} if cfg.userspace_wan else {}),
         "exp_name": cfg.exp_name,
         "protocol": cfg.exp_protocol,
         "num_parties": cfg.num_parties,
@@ -583,6 +700,7 @@ def _select_run_config(
         "threads": threads,
         "repetition_index": repetition_index,
         "node_prefix": cfg.node_prefix,
+        "hosts": cfg.hosts,
         "num_comm_threads": cfg.num_comm_threads,
         "scale_factor": cfg.scale_factor if cfg.use_scale_factor else None,
         "cmake_args": _flatten_args(cfg.cmake_args),
@@ -794,9 +912,8 @@ def _manage_wan_simulation(cfg: ExperimentConfig, state: str) -> None:
         print(f"Warning: WAN simulation script not found at {cluster_wan_sim_script}", file=sys.stderr)
         return
 
-    # Build list of nodes: node1, node2, ..., node{num_parties-1}
-    # (node0 is the current node, so we start from 1)
-    nodes = [f"{cfg.node_prefix}{i}" for i in range(1, cfg.num_parties)]
+    # The first host is the coordinator, so WAN shaping applies to its peers.
+    nodes = cfg.hosts[1:cfg.num_parties]
 
     if not nodes:
         return
@@ -833,6 +950,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(arg_list)
     cfg = derive_config(args)
+
+    if cfg.wan_sim == "rootless-local":
+        p = cfg.rootless["physical"]
+        print(f"Requested rootless-local: three local NoCopy parties; lo MTU {p['mtu']}; "
+              f"delay {p['latency_ms']:g} ms/traversal (~{2*p['latency_ms']:g} ms RTT); "
+              f"aggregate {p['bandwidth_gbps']:g} Gbit/s; queue {p['queue_limit_packets']} packets; "
+              f"cost-model hints {cfg.rootless['cost_model']}. "
+              "Single-host qualitative latency simulation; shared CPU and aggregate loopback traffic.", flush=True)
+        if not cfg.rootless["managed_shaping"]:
+            try:
+                return rootless_wan.enter(arg_list, p, args.wan_sim_check)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise SystemExit(f"Error: {exc}") from exc
+
+    if cfg.wan_sim == "userspace-distributed":
+        print("Userspace distributed WAN: 6.5 ms per direction; 12 Gbit/s application-byte cap "
+              "per directed party link; no sudo, namespaces, or host shaping. Qualitative simulation.", flush=True)
 
     wan_sim_enabled = False
     try:
