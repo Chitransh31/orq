@@ -2537,6 +2537,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--scale-factor", type=float, default=0.1, help="DBGEN scale factor")
+    parser.add_argument("--sweep-preset", choices=("legacy", "controlled-common"), default="legacy")
+    parser.add_argument("--input-mode", choices=("direct", "materialized", "both"), default="both")
+    parser.add_argument("--seed", type=int, default=20260908)
+    parser.add_argument("--warmups", type=int, default=5)
+    parser.add_argument("--timing-repetitions", type=int, default=30)
+    parser.add_argument("--max-transition-probes", type=int, default=512)
+    parser.add_argument("--include-zero", action="store_true", help="separate zero-row boundary controls")
     parser.add_argument(
         "--queries",
         type=parse_queries,
@@ -2595,11 +2602,23 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--threads must be positive")
     if args.repetitions <= 0:
         raise ValueError("--repetitions must be positive")
+    if args.warmups < 0 or args.timing_repetitions <= 0:
+        raise ValueError("warmups must be nonnegative and timing repetitions positive")
+    if not 0 <= args.max_transition_probes <= 512:
+        raise ValueError("--max-transition-probes must be between 0 and 512")
+    if args.sweep_preset == "controlled-common":
+        if duckdb.__version__ != "1.5.4" or args.threads != 1:
+            raise ValueError("controlled-common requires DuckDB 1.5.4 and --threads 1")
+        if args.optimizer_mode != "both":
+            raise ValueError("controlled-common requires --optimizer-mode both for verified controls")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _validate_args(args)
+    if args.sweep_preset == "controlled-common":
+        from duckdb_controlled import run
+        return run(args, sys.modules[__name__])
     repo_root = Path(__file__).resolve().parents[1]
     output_dir, database = _prepare_paths(args, repo_root)
     started_at = datetime.now(timezone.utc)
