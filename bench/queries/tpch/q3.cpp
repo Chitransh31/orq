@@ -57,12 +57,19 @@ using T = int64_t;
 
 using sec = duration<float, seconds::period>;
 
+#if TPCH_SELECTIVITY_PLAN == 1
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-a";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(customer,join(lineitem,orders))";
+#else
 #ifdef TPCH_DUCKDB_CANONICAL_PLAN
 constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
 #else
 constexpr auto TPCH_PLAN_VARIANT = "original-orq";
 #endif
+
 constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(customer,orders),lineitem)";
+
+#endif
 
 int main(int argc, char** argv) {
     orq_init(argc, argv);
@@ -91,6 +98,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Query DB setup
+    orq::benchmarking::tpch_experiment::Scope experiment("q3", TPCH_PLAN_ASSOCIATION);
     auto db = TPCDatabase<T>(sf, sqlite_db);
 
     using A = ASharedVector<T>;
@@ -122,6 +130,7 @@ int main(int argc, char** argv) {
     print_table(LineItem.open_with_schema(), pid);
 #endif
 
+    experiment.begin_query();
     stopwatch::timepoint("Start");
     stopwatch::profile_init();
 
@@ -144,7 +153,18 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("Revenue");
 
-    auto CO = Customers.inner_join(Orders, {"[CustKey]"});
+#if TPCH_SELECTIVITY_PLAN == 1
+    Orders.addColumns({"GroupRevenue"});
+    auto OL = join(Orders, LineItem, {"[OrderKey]"},
+        {{"Revenue", "GroupRevenue", sum<A>}, {"[OrderDate]", "[OrderDate]", copy<B>},
+         {"[CustKey]", "[CustKey]", copy<B>}});
+    OL.deleteColumns({"Revenue"});
+    stopwatch::timepoint("Orders + Lineitem join");
+    auto COL = join(Customers, OL, {"[CustKey]"});
+    COL.deleteColumns({"[CustKey]"});
+    stopwatch::timepoint("Customer + Orders/Lineitem join");
+#else
+    auto CO = join(Customers, Orders, {"[CustKey]"});
     CO.deleteColumns({"[CustKey]"});
 
     stopwatch::timepoint("Customers + Orders join");
@@ -152,7 +172,7 @@ int main(int argc, char** argv) {
     CO.addColumns({"GroupRevenue"});
     // TODO: doesn't group by [OrderDate] but [OrderKey] should be unique anyways so I'm not sure it
     // matters
-    auto COL = CO.inner_join(LineItem, {"[OrderKey]"},
+    auto COL = join(CO, LineItem, {"[OrderKey]"},
                              {
                                  {"Revenue", "GroupRevenue", sum<A>},
                                  {"[OrderDate]", "[OrderDate]", copy<B>},
@@ -161,26 +181,35 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("Customers/Orders + LineItem join");
 
+#endif
+
     COL.addColumns({"[GroupRevenue]"});
     COL.convert_a2b("GroupRevenue", "[GroupRevenue]");
     COL.deleteColumns({"GroupRevenue"});
 
     // Sort over valid first to move valid columns to the top
     COL.sort({std::make_pair(ENC_TABLE_VALID, DESC), std::make_pair("[GroupRevenue]", DESC),
-              std::make_pair("[OrderDate]", ASC)});
+              std::make_pair("[OrderDate]", ASC)
+#ifdef TPCH_SELECTIVITY_EXPERIMENT
+              , std::make_pair("[OrderKey]", ASC)
+#endif
+              });
 
     stopwatch::timepoint("Sort");
 
     // Return only the 10 orders with the highest value
-    COL.head(10);
+    COL.head(std::min<size_t>(10, COL.size()));
 
 #ifdef QUERY_PROFILE
     // Include the final mask and shuffle in benchmarking time
     COL.finalize();
+    stopwatch::timepoint("Finalize");
 #endif
 
+    experiment.finish(COL);
     stopwatch::done();          // print wall clock time
     stopwatch::profile_done();  // print profiling data
+    experiment.emit();
 
     runTime->print_statistics();
     runTime->print_communicator_statistics();
@@ -194,6 +223,8 @@ int main(int argc, char** argv) {
     auto key_col = COL.get_column(resultOpened, "[OrderKey]");
     auto revenue_col = COL.get_column(resultOpened, "[GroupRevenue]");
     auto date_col = COL.get_column(resultOpened, "[OrderDate]");
+    orq::benchmarking::tpch_experiment::result<T>({"OrderKey","Revenue","OrderDate"}, {key_col,revenue_col,date_col});
+
 
     if (pid == 0) {
         // Run Q3 through SQL to verify result
@@ -219,6 +250,11 @@ int main(int argc, char** argv) {
             order by
                 Revenue DESC,
                 o.OrderDate
+        )sql"
+#ifdef TPCH_SELECTIVITY_EXPERIMENT
+        ", l.OrderKey "
+#endif
+        R"sql(
             limit 10
         )sql";
         sqlite3_stmt* stmt;
@@ -232,9 +268,10 @@ int main(int argc, char** argv) {
         auto res = sqlite3_step(stmt);
         auto i = 0;
         while (res == SQLITE_ROW) {
-            int sql_key = sqlite3_column_int(stmt, 0);
-            int sql_revenue = sqlite3_column_int(stmt, 1);
-            int sql_date = sqlite3_column_int(stmt, 2);
+            if (i >= key_col.size()) throw std::runtime_error("SQLite returned more rows than ORQ");
+            int64_t sql_key = sqlite3_column_int64(stmt, 0);
+            int64_t sql_revenue = sqlite3_column_int64(stmt, 1);
+            int64_t sql_date = sqlite3_column_int64(stmt, 2);
 
             ASSERT_SAME(sql_key, key_col[i]);
             ASSERT_SAME(sql_revenue, revenue_col[i]);
@@ -253,7 +290,7 @@ int main(int argc, char** argv) {
         }
 
         if (res != SQLITE_DONE) {
-            std::cerr << "SQLite error: " << sqlite3_errmsg(sqlite_db) << "\n";
+            throw std::runtime_error(sqlite3_errmsg(sqlite_db));
         }
     }
 
@@ -261,5 +298,9 @@ int main(int argc, char** argv) {
     sqlite3_close(sqlite_db);
 #endif
 
+#ifndef QUERY_PROFILE
+    if (orq::benchmarking::tpch_experiment::enabled && pid == 0)
+        std::cout << "[TPCH_CORRECTNESS] sqlite=passed" << std::endl;
+#endif
     return 0;
 }

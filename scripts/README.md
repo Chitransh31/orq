@@ -351,3 +351,18 @@ Logs contain `[USERSPACE_WAN]` per-party counters for each repetition. The repor
 requires these counters and traffic observations and labels results `wan-userspace`.
 Party 2's local relay normally has zero connections: connections 0–2 and 1–2 are
 relayed at their initiating hosts, so its traffic is still delayed in both directions.
+
+## Selectivity-dependent ORQ associations
+
+`run-tpch-selectivity-3pc.sh` runs all fixed associations on identical public
+pre-sharing reductions. It requires validated correctness evidence before
+benchmarking and uses the existing local/cluster launcher. See
+[the experiment protocol](tpch-selectivity-plans/README.md) for exact grids,
+new targets, smoke/full commands, provenance and interpretation limits.
+The original full-input runner and frozen canonical manifest are unchanged.
+
+### Detached presentation study (implementation only)
+
+The `presentation` grid adds full-input anchors and selected smaller-input comparisons: 53 combinations / 159 measured WAN executions at three repetitions. `scripts/tpch_supervisor.py` provides explicit detached `start`, read-only `status`, explicit `resume`, and graceful `stop`. Jobs do not depend on an active assistant session. Nothing starts automatically.
+
+Read [TPCH_PRESENTATION_RUNBOOK.md](TPCH_PRESENTATION_RUNBOOK.md) before any launch or recovery. Existing jobs are discoverable with `python3 scripts/tpch_supervisor.py status` from the repository root. New report exports and plots are provided by `export_tpch_presentation.py` and `plot_orq_presentation.py`; historical results remain separate. Do not run experimental correctness or performance workloads until explicitly requested.

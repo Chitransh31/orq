@@ -22,6 +22,7 @@
 #include <sstream>
 
 #include "orq.h"
+#include "tpch_experiment.h"
 
 using namespace orq::debug;
 using namespace orq::service;
@@ -71,6 +72,115 @@ class TPCDatabase {
    protected:
     std::optional<uint64_t> dataSeed;
     std::optional<std::mt19937_64> deterministicDataGenerator;
+
+    std::map<std::string, orq::benchmarking::selectivity::Percent> reductions;
+    std::map<std::string, size_t> originalSizes;
+    uint64_t selectivitySeed = 20260908;
+
+    void configureSelectivity() {
+        using namespace orq::benchmarking;
+        reductions = selectivity::parse(runTime->getArg<std::string>("tpch-selectivity", "tpch-sel", ""));
+        selectivitySeed = selectivity::unsigned_integer(runTime->getArg<std::string>(
+            "tpch-selectivity-seed", "tpch-sel-seed", "20260908"));
+        if ((!reductions.empty() || tpch_experiment::enabled) && !dataSeed)
+            throw std::invalid_argument("selectivity requires -tpch-seed UINT64 (single dash, separate value)");
+    }
+
+    void reduce(const std::string& relation, std::vector<Vector<T>*> columns,
+                std::vector<Vector<T>*> keyColumns) {
+        using namespace orq::benchmarking;
+        if (!reductions.count(relation)) return;
+        const auto start = std::chrono::steady_clock::now();
+        size_t n = columns.at(0)->size(), k = reductions.at(relation).count(n);
+        originalSizes[relation] = n;
+        if (!k) throw std::invalid_argument("zero-length selected input is not supported; no clamping is performed");
+        std::vector<size_t> keep;
+        selectivity::Hash originalHash;
+        if (runTime->getPartyID() == 0) {
+            originalHash.string(relation); originalHash.integer(columns.size()); originalHash.integer(n);
+            for (size_t i=0;i<n;++i) for (const auto* col : columns)
+                originalHash.integer(static_cast<uint64_t>((*col)[i]));
+            std::vector<std::vector<int64_t>> keys(n);
+            for (auto* col : keyColumns) for (size_t i=0;i<n;++i) keys[i].push_back((*col)[i]);
+            keep = selectivity::indices(keys,k,selectivitySeed);
+#ifndef QUERY_PROFILE
+            if constexpr (tpch_experiment::enabled) {
+                std::ofstream file("tpch-selection-" + relation + ".bin", std::ios::binary | std::ios::trunc);
+                for (auto index : keep) {
+                    unsigned char bytes[8];
+                    for (int j=0;j<8;++j) bytes[j]=static_cast<unsigned char>(static_cast<uint64_t>(index) >> (8*j));
+                    file.write(reinterpret_cast<const char*>(bytes),8);
+                }
+                file.close();
+                if (!file) throw std::runtime_error("cannot write selection index audit");
+            }
+#endif
+        }
+        for (auto* col : columns) {
+            Vector<T> reduced(k);
+            if (runTime->getPartyID() == 0)
+                for (size_t i=0;i<k;++i) reduced[i] = (*col)[keep[i]];
+            col->resize(k);
+            *col = reduced;
+        }
+        if (runTime->getPartyID() == 0) {
+            std::ostringstream out;
+            out << std::setprecision(17) << "[TPCH_REDUCTION] {\"relation\":" << tpch_experiment::quoted(relation)
+                << ",\"base_rows\":" << n << ",\"selected_rows\":" << k
+                << ",\"percent\":" << tpch_experiment::quoted(reductions.at(relation).str())
+                << ",\"base_sha256\":" << tpch_experiment::quoted(originalHash.finish())
+                << ",\"seed\":" << selectivitySeed << ",\"seconds\":"
+                << std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count() << "}";
+            std::cout << out.str() << std::endl;
+        }
+    }
+
+    EncodedTable<T> shareTable(const std::string& relation, const std::vector<Vector<T>>& data,
+                              const std::vector<std::string>& schema) {
+        using namespace orq::benchmarking;
+        if constexpr (!tpch_experiment::enabled) return secret_share<T>(data,schema);
+        auto start = std::chrono::steady_clock::now();
+        if (tpch_experiment::enabled && runTime->getPartyID() == 0) {
+            selectivity::Hash hash, keyHash;
+            hash.integer(schema.size());
+            for (auto& name : schema) hash.string(name);
+            size_t n = data.at(0).size(); hash.integer(n);
+            std::vector<std::string> keys = relation == "lineitem" ? std::vector<std::string>{"[OrderKey]","[LineNumber]"}
+                : relation == "orders" ? std::vector<std::string>{"[OrderKey]"}
+                : relation == "part" ? std::vector<std::string>{"[PartKey]"}
+                : relation == "partsupp" ? std::vector<std::string>{"[PartKey]","[SuppKey]"}
+                : relation == "customer" ? std::vector<std::string>{"[CustKey]"}
+                : relation == "supplier" ? std::vector<std::string>{"[SuppKey]"}
+                : relation == "nation" ? std::vector<std::string>{"[NationKey]"} : std::vector<std::string>{"[RegionKey]"};
+            std::set<std::vector<T>> unique;
+            for (size_t i=0;i<n;++i) {
+                for (const auto& col : data) hash.integer(static_cast<uint64_t>(col[i]));
+                std::vector<T> key;
+                for (const auto& name : keys) {
+                    auto index = std::find(schema.begin(),schema.end(),name)-schema.begin();
+                    if (index == schema.size()) throw std::runtime_error("missing input key column");
+                    key.push_back(data[index][i]); keyHash.integer(static_cast<uint64_t>(key.back()));
+                }
+                if (!unique.insert(key).second) throw std::runtime_error("duplicate input key in " + relation);
+            }
+            std::ostringstream out;
+            out << "[TPCH_INPUT] {\"relation\":" << tpch_experiment::quoted(relation)
+                << ",\"schema\":" << tpch_experiment::strings(schema) << ",\"base_rows\":"
+                << (originalSizes.count(relation) ? originalSizes.at(relation) : n)
+                << ",\"rows\":" << n << ",\"data_seed\":" << *dataSeed
+                << ",\"sha256\":" << tpch_experiment::quoted(hash.finish())
+                << ",\"key_sha256\":" << tpch_experiment::quoted(keyHash.finish()) << "}";
+            std::cout << out.str() << std::endl;
+        }
+        auto sharingStart = std::chrono::steady_clock::now();
+        auto table = secret_share<T>(data,schema);
+        if (tpch_experiment::enabled && runTime->getPartyID() == 0) {
+            std::cout << "[TPCH_SHARE] {\"relation\":" << tpch_experiment::quoted(relation)
+                << ",\"audit_seconds\":" << std::chrono::duration<double>(sharingStart-start).count()
+                << ",\"seconds\":" << std::chrono::duration<double>(std::chrono::steady_clock::now()-sharingStart).count() << "}" << std::endl;
+        }
+        return table;
+    }
 
     void configureDataGenerator() {
         auto seed_arg = runTime->getArg<std::string>("tpch-seed", "z", "");
@@ -146,10 +256,11 @@ class TPCDatabase {
 
     size_t lineItemsSize = 0;
 
-    TPCDatabase(double sf) : scaleFactor(sf), sqlite_db(nullptr) { configureDataGenerator(); }
+    TPCDatabase(double sf) : scaleFactor(sf), sqlite_db(nullptr) { configureDataGenerator(); configureSelectivity(); }
 
     TPCDatabase(double sf, sqlite3* sqlite_db) : scaleFactor(sf), sqlite_db(sqlite_db) {
         configureDataGenerator();
+        configureSelectivity();
     }
 
     std::optional<uint64_t> getDataSeed() const { return dataSeed; }
@@ -275,7 +386,7 @@ class TPCDatabase {
             "[CustKey]",   "[C_Name]",  "[Address]", "[NationKey]",  "[Phone]",
             "[CntryCode]", "[AcctBal]", "AcctBal",   "[MktSegment]", "[Comment]"};
 
-        EncodedTable<T> table = secret_share<T>({custkey, name, address, nationKey, phone,
+        EncodedTable<T> table = shareTable("customer", {custkey, name, address, nationKey, phone,
                                                  cntrycode, acctbal, acctbal, mktsegment, comment},
                                                 schema);
 
@@ -377,6 +488,10 @@ class TPCDatabase {
 
         // Enum of 4 instructions
         auto shipInstruct = randomColumn(S, 0, 4);
+        reduce("lineitem", {&orderKey,&returnFlag,&lineStatus,&quantity,&extendedPrice,&discount,
+            &tax,&shipDate,&commitDate,&receiptDate,&shipMode,&partKey,&shipInstruct,&lineNumber,&suppKey},
+            {&orderKey,&lineNumber});
+        S = orderKey.size();
 
         if (sqlite_db) {
             // Create table in SQLite
@@ -479,7 +594,7 @@ class TPCDatabase {
             schema.insert(schema.end(), proactive_schema.begin(), proactive_schema.end());
         }
 
-        EncodedTable<T> table = secret_share<T>(data, schema);
+        EncodedTable<T> table = shareTable("lineitem", data, schema);
 
         table.tableName = "LINEITEMS";
         return table;
@@ -516,8 +631,10 @@ class TPCDatabase {
 
         // Technically based on LineItem; for now just randomize 0-1-2
         auto orderStatus = randomColumn(S, 0, 2 + 1);
+        reduce("orders", {&orderKey,&custKey,&comment,&orderPriority,&orderDate,&totalPrice,&orderStatus}, {&orderKey});
+        S = orderKey.size();
 
-        EncodedTable<T> table = secret_share<T>(
+        EncodedTable<T> table = shareTable("orders",
             {orderKey, custKey, comment, orderPriority, orderDate, totalPrice, orderStatus},
             schema);
 
@@ -605,7 +722,7 @@ class TPCDatabase {
         // 4-bit comment
         auto comment = randomColumn(S, 0, (1 << COMMENT_BITS));
 
-        EncodedTable<T> table = secret_share<T>({regionKey, name, comment}, schema);
+        EncodedTable<T> table = shareTable("region", {regionKey, name, comment}, schema);
 
         if (sqlite_db) {
             sqlite3_exec(sqlite_db, "BEGIN TRANSACTION;", 0, 0, NULL);
@@ -743,7 +860,7 @@ class TPCDatabase {
             single_cout("SQLite setup skipped")
         }
 
-        EncodedTable<T> table = secret_share<T>({nationKey, name, regionKey, comment}, schema);
+        EncodedTable<T> table = shareTable("nation", {nationKey, name, regionKey, comment}, schema);
 
         table.tableName = "NATION";
         return table;
@@ -773,9 +890,11 @@ class TPCDatabase {
         // Spec defines this as a concatenation of 5 words from a list of ~100, using a range of 20
         // to get a similar representation for any one word
         auto name = randomColumn(S, 0, 20 + 1);
+        reduce("part", {&partkey,&brand,&container,&type,&size,&name}, {&partkey});
+        S = partkey.size();
 
         EncodedTable<T> table =
-            secret_share<T>({partkey, brand, container, type, size, name}, schema);
+            shareTable("part", {partkey, brand, container, type, size, name}, schema);
 
         if (sqlite_db) {
             sqlite3_exec(sqlite_db, "BEGIN TRANSACTION;", 0, 0, NULL);
@@ -803,7 +922,7 @@ class TPCDatabase {
             sqlite3_prepare_v2(sqlite_db, sqlInsert, -1, &stmt, nullptr);
 
             // Insert data into SQLite
-            for (size_t i = 0; i < partSize(); ++i) {
+            for (size_t i = 0; i < S; ++i) {
                 sqlite3_bind_int(stmt, 1, partkey[i]);
                 sqlite3_bind_int(stmt, 2, brand[i]);
                 sqlite3_bind_int(stmt, 3, container[i]);
@@ -870,7 +989,7 @@ class TPCDatabase {
         auto phone = randomColumn(S, 1000000000, 2000000000 + 1);
 
         EncodedTable<T> table =
-            secret_share<T>({suppkey, nationkey, acctbal, name, address, phone, comment}, schema);
+            shareTable("supplier", {suppkey, nationkey, acctbal, name, address, phone, comment}, schema);
 
         if (sqlite_db) {
             sqlite3_exec(sqlite_db, "BEGIN TRANSACTION;", 0, 0, NULL);
@@ -964,7 +1083,7 @@ class TPCDatabase {
         auto availQty = randomColumn(S, 1, 9999 + 1);
 
         EncodedTable<T> table =
-            secret_share<T>({suppkey, partkey, supplyCost, supplyCost, availQty}, schema);
+            shareTable("partsupp", {suppkey, partkey, supplyCost, supplyCost, availQty}, schema);
 
         if (sqlite_db) {
             sqlite3_exec(sqlite_db, "BEGIN TRANSACTION;", 0, 0, NULL);

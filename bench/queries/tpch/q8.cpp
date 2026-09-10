@@ -67,6 +67,19 @@ using namespace orq::benchmarking;
 using A = ASharedVector<T>;
 using B = BSharedVector<T>;
 
+#if TPCH_SELECTIVITY_PLAN == 1
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-a";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(join(customer,join(nation_region,region)),orders),lineitem),part),join(nation_name,supplier))";
+#elif TPCH_SELECTIVITY_PLAN == 2
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-b";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(customer,join(nation_region,region)),join(join(lineitem,part),orders)),supplier),nation_name)";
+#elif TPCH_SELECTIVITY_PLAN == 3
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-c";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(join(customer,join(nation_region,region)),orders),lineitem),join(nation_name,supplier)),part)";
+#elif TPCH_SELECTIVITY_PLAN == 4
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-d";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(customer,join(nation_region,region)),join(join(lineitem,part),orders)),join(nation_name,supplier))";
+#else
 #ifdef TPCH_DUCKDB_CANONICAL_PLAN
 constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
 constexpr auto TPCH_PLAN_ASSOCIATION =
@@ -75,8 +88,9 @@ constexpr auto TPCH_PLAN_ASSOCIATION =
 #else
 constexpr auto TPCH_PLAN_VARIANT = "original-orq";
 constexpr auto TPCH_PLAN_ASSOCIATION =
-    "join(join(join(join(join(join(part,lineitem),orders),customer),nation),region),"
-    "join(supplier,nation_name))";
+    "join(join(join(join(join(customer,join(join(lineitem,part),orders)),nation_region),region),supplier),nation_name)";
+#endif
+
 #endif
 
 int main(int argc, char** argv) {
@@ -109,6 +123,7 @@ int main(int argc, char** argv) {
     ////////////////////////////////////////////////////////////////
     // Database Initialization
 
+    orq::benchmarking::tpch_experiment::Scope experiment("q8", TPCH_PLAN_ASSOCIATION);
     auto db = TPCDatabase<T>(sf, sqlite_db);
     single_cout("Q8 SF " << db.scaleFactor);
     single_cout("[QUERY_PLAN] query=q8 variant=" << TPCH_PLAN_VARIANT
@@ -124,6 +139,9 @@ int main(int argc, char** argv) {
     auto Customer = db.getCustomersTable();
     auto Nation1 = db.getNationTable();
     auto Nation2 = Nation1.deepcopy();
+    if constexpr (orq::benchmarking::tpch_experiment::enabled) {
+        Nation1.tableName = "nation_region"; Nation2.tableName = "nation_name";
+    }
     auto Region = db.getRegionTable();
 
     // project tables
@@ -136,6 +154,7 @@ int main(int argc, char** argv) {
     Nation2.project({"[NationKey]", "[RegionKey]", "[Name]"});
     Region.project({"[RegionKey]", "[Name]"});
 
+    experiment.begin_query();
     stopwatch::timepoint("Start");
     stopwatch::profile_init();
 
@@ -166,59 +185,111 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("calculate volume");
 
-    auto PartLineItemJoin = Part.inner_join(LineItem, {"[PartKey]"}, {});
+#if TPCH_SELECTIVITY_PLAN
+    // All branches below keep the unique side on the left. Nr and Nn are distinct roles.
+    auto RN = join(Region, Nation1, {"[RegionKey]"}, {});
+    RN.project({"[NationKey]"});
+    auto RC = join(RN, Customer, {"[NationKey]"}, {});
+    RC.project({"[CustKey]"});
+    RN.deleteTable();
+#if TPCH_SELECTIVITY_PLAN == 1 || TPCH_SELECTIVITY_PLAN == 3
+    auto RCO = join(RC, Orders, {"[CustKey]"}, {});
+    RCO.project({"[OrderKey]", "[Year]"});
+    auto Items = join(RCO, LineItem, {"[OrderKey]"}, {{"[Year]", "[Year]", copy<B>}});
+    Items.deleteColumns({"[OrderKey]"});
+    RCO.deleteTable();
+#else
+    auto PL = join(Part, LineItem, {"[PartKey]"}, {});
+    PL.deleteColumns({"[PartKey]"});
+    auto OL = join(Orders, PL, {"[OrderKey]"},
+        {{"[CustKey]", "[CustKey]", copy<B>}, {"[Year]", "[Year]", copy<B>}});
+    OL.deleteColumns({"[OrderKey]"});
+    auto Items = join(RC, OL, {"[CustKey]"}, {});
+    Items.deleteColumns({"[CustKey]"});
+    PL.deleteTable(); OL.deleteTable();
+#endif
+    RC.deleteTable();
+#if TPCH_SELECTIVITY_PLAN == 2
+    auto SupplierItems = join(Supplier, Items, {"[SuppKey]"},
+        {{"[NationKey]", "[NationKey]", copy<B>}});
+    SupplierItems.deleteColumns({"[SuppKey]"});
+    auto FinalJoin = join(Nation2, SupplierItems, {"[NationKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    SupplierItems.deleteTable();
+#else
+    auto NS = join(Nation2, Supplier, {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}});
+    NS.project({"[SuppKey]", "[Name]"});
+#if TPCH_SELECTIVITY_PLAN == 1
+    auto PartItems = join(Part, Items, {"[PartKey]"}, {});
+    PartItems.deleteColumns({"[PartKey]"});
+    auto FinalJoin = join(NS, PartItems, {"[SuppKey]"}, {{"[Name]", "[Name]", copy<B>}});
+    PartItems.deleteTable();
+#elif TPCH_SELECTIVITY_PLAN == 3
+    auto SupplierItems = join(NS, Items, {"[SuppKey]"}, {{"[Name]", "[Name]", copy<B>}});
+    SupplierItems.deleteColumns({"[SuppKey]"});
+    auto FinalJoin = join(Part, SupplierItems, {"[PartKey]"}, {});
+    SupplierItems.deleteTable();
+#else
+    auto FinalJoin = join(NS, Items, {"[SuppKey]"}, {{"[Name]", "[Name]", copy<B>}});
+#endif
+    NS.deleteTable();
+#endif
+    Items.deleteTable();
+#else
+    auto PartLineItemJoin = join(Part, LineItem, {"[PartKey]"}, {});
     PartLineItemJoin.deleteColumns({"[PartKey]"});
 
     auto OrderPartLineItemJoin =
-        Orders.inner_join(PartLineItemJoin, {"[OrderKey]"},
+        join(Orders, PartLineItemJoin, {"[OrderKey]"},
                           {{"[CustKey]", "[CustKey]", copy<B>}, {"[Year]", "[Year]", copy<B>}});
     OrderPartLineItemJoin.deleteColumns({"[OrderKey]"});
 
-    auto CustomerOrderPartLineItemJoin = Customer.inner_join(
-        OrderPartLineItemJoin, {"[CustKey]"}, {{"[NationKey]", "[NationKey]", copy<B>}});
+    auto CustomerOrderPartLineItemJoin = join(Customer, OrderPartLineItemJoin, {"[CustKey]"}, {{"[NationKey]", "[NationKey]", copy<B>}});
     CustomerOrderPartLineItemJoin.deleteColumns({"[CustKey]"});
 
 #ifdef TPCH_DUCKDB_CANONICAL_PLAN
     // DuckDB canonical association builds the Region/Nation branch separately.
     // ORQ still keeps the primary-key side on the left for each join.
-    auto SelectedCustomerNations = Region.inner_join(Nation1, {"[RegionKey]"}, {});
+    auto SelectedCustomerNations = join(Region, Nation1, {"[RegionKey]"}, {});
     SelectedCustomerNations.project({"[NationKey]"});
 
-    auto RegionalCustomerOrderPartLineItemJoin = SelectedCustomerNations.inner_join(
-        CustomerOrderPartLineItemJoin, {"[NationKey]"}, {});
+    auto RegionalCustomerOrderPartLineItemJoin = join(SelectedCustomerNations, CustomerOrderPartLineItemJoin, {"[NationKey]"}, {});
     RegionalCustomerOrderPartLineItemJoin.deleteColumns({"[NationKey]"});
 
-    auto SupplierRegionalCustomerOrderPartLineItemJoin = Supplier.inner_join(
-        RegionalCustomerOrderPartLineItemJoin, {"[SuppKey]"},
+    auto SupplierRegionalCustomerOrderPartLineItemJoin = join(Supplier, RegionalCustomerOrderPartLineItemJoin, {"[SuppKey]"},
         {{"[NationKey]", "[NationKey]", copy<B>}});
     SupplierRegionalCustomerOrderPartLineItemJoin.deleteColumns({"[SuppKey]"});
 
-    auto FinalJoin = Nation2.inner_join(SupplierRegionalCustomerOrderPartLineItemJoin,
+    auto FinalJoin = join(Nation2, SupplierRegionalCustomerOrderPartLineItemJoin,
                                         {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}});
 
     SelectedCustomerNations.deleteTable();
     RegionalCustomerOrderPartLineItemJoin.deleteTable();
     SupplierRegionalCustomerOrderPartLineItemJoin.deleteTable();
 #else
-    auto N1CustomerOrderPartLineItemJoin = Nation1.inner_join(
-        CustomerOrderPartLineItemJoin, {"[NationKey]"}, {{"[RegionKey]", "[RegionKey]", copy<B>}});
+    auto N1CustomerOrderPartLineItemJoin = join(Nation1, CustomerOrderPartLineItemJoin, {"[NationKey]"}, {{"[RegionKey]", "[RegionKey]", copy<B>}});
     N1CustomerOrderPartLineItemJoin.deleteColumns({"[NationKey]"});
 
     auto RegN1CustomerOrderPartLineItemJoin =
-        Region.inner_join(N1CustomerOrderPartLineItemJoin, {"[RegionKey]"}, {});
+        join(Region, N1CustomerOrderPartLineItemJoin, {"[RegionKey]"}, {});
     RegN1CustomerOrderPartLineItemJoin.deleteColumns({"[RegionKey]"});
 
     auto SupplierRegN1CustomerOrderPartLineItemJoin =
-        Supplier.inner_join(RegN1CustomerOrderPartLineItemJoin, {"[SuppKey]"},
+        join(Supplier, RegN1CustomerOrderPartLineItemJoin, {"[SuppKey]"},
                             {{"[NationKey]", "[NationKey]", copy<B>}});
     SupplierRegN1CustomerOrderPartLineItemJoin.deleteColumns({"[SuppKey]"});
 
-    auto FinalJoin = Nation2.inner_join(SupplierRegN1CustomerOrderPartLineItemJoin, {"[NationKey]"},
+    auto FinalJoin = join(Nation2, SupplierRegN1CustomerOrderPartLineItemJoin, {"[NationKey]"},
                                         {{"[Name]", "[Name]", copy<B>}});
+#endif
+
 #endif
 
     stopwatch::timepoint("join");
 
+#ifdef TPCH_SELECTIVITY_EXPERIMENT
+    FinalJoin.project({"[Year]", "Volume", "[Name]"});
+#endif
     // compute a flag for whether the nation matches, then filter Volume based on the flag
     FinalJoin.addColumns({"[ValidNation]", "ValidNation", "VolumeFiltered"});
 
@@ -239,7 +310,7 @@ int main(int argc, char** argv) {
     // by an attribute from that table. This will help limit the size of the
     // private division we need to do below.
     result.sort({ENC_TABLE_VALID});
-    result.tail(Orders.size());
+    result.tail(std::min(result.size(), Orders.size()));
 
     stopwatch::timepoint("aggregation");
 
@@ -255,10 +326,13 @@ int main(int argc, char** argv) {
 #ifdef QUERY_PROFILE
     // Include the final mask and shuffle in benchmarking time
     result.finalize();
+    stopwatch::timepoint("Finalize");
 #endif
 
+    experiment.finish(result);
     stopwatch::done();          // print wall clock time
     stopwatch::profile_done();  // print profiling data
+    experiment.emit();
 
     runTime->print_statistics();
     runTime->print_communicator_statistics();
@@ -271,6 +345,8 @@ int main(int argc, char** argv) {
     auto resultOpened = result.open_with_schema();
     auto year_col = result.get_column(resultOpened, "[Year]");
     auto market_share_col = result.get_column(resultOpened, "[MarketShare]");
+    orq::benchmarking::tpch_experiment::result<T>({"Year","MarketShare"}, {year_col,market_share_col});
+
 
     // SQL validation
     if (pid == 0) {
@@ -319,7 +395,7 @@ int main(int argc, char** argv) {
         sqlite3_stmt* stmt;
         ret = sqlite3_prepare_v2(sqlite_db, query, -1, &stmt, NULL);
         if (ret != SQLITE_OK) {
-            printf("SQL error: %s\n", sqlite3_errmsg(sqlite_db));
+            throw std::runtime_error(sqlite3_errmsg(sqlite_db));
         }
         // Fill in query placeholders
         sqlite3_bind_int(stmt, 1, NATION_NAME);
@@ -333,8 +409,9 @@ int main(int argc, char** argv) {
         auto res = sqlite3_step(stmt);
         auto i = 0;
         while (res == SQLITE_ROW) {
-            int sql_year = sqlite3_column_int(stmt, 0);
-            int sql_market_share = sqlite3_column_int(stmt, 1);
+            if (i >= year_col.size()) throw std::runtime_error("SQLite returned more rows than ORQ");
+            int64_t sql_year = sqlite3_column_int64(stmt, 0);
+            int64_t sql_market_share = sqlite3_column_int64(stmt, 1);
 
             ASSERT_SAME(sql_year, year_col[i]);
             ASSERT_SAME(sql_market_share, market_share_col[i]);
@@ -361,5 +438,9 @@ int main(int argc, char** argv) {
         sqlite3_close(sqlite_db);
     }
 
+#ifndef QUERY_PROFILE
+    if (orq::benchmarking::tpch_experiment::enabled && pid == 0)
+        std::cout << "[TPCH_CORRECTNESS] sqlite=passed" << std::endl;
+#endif
     return 0;
 }

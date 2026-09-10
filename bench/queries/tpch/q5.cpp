@@ -56,6 +56,10 @@ using T = int64_t;
 
 using sec = duration<float, seconds::period>;
 
+#if TPCH_SELECTIVITY_PLAN == 1
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-a";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(customer,orders),join(nation,region)),lineitem),supplier)";
+#else
 #ifdef TPCH_DUCKDB_CANONICAL_PLAN
 constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
 constexpr auto TPCH_PLAN_ASSOCIATION =
@@ -63,6 +67,8 @@ constexpr auto TPCH_PLAN_ASSOCIATION =
 #else
 constexpr auto TPCH_PLAN_VARIANT = "original-orq";
 constexpr auto TPCH_PLAN_ASSOCIATION = "orq-original-duplicated-lineitem-branches";
+#endif
+
 #endif
 
 int main(int argc, char** argv) {
@@ -93,6 +99,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Query DB setup
+    orq::benchmarking::tpch_experiment::Scope experiment("q5", TPCH_PLAN_ASSOCIATION);
     auto db = TPCDatabase<T>(sf, sqlite_db);
 
     using A = ASharedVector<T>;
@@ -136,6 +143,7 @@ int main(int argc, char** argv) {
     print_table(Nation.open_with_schema(), pid);
 #endif
 
+    experiment.begin_query();
     stopwatch::timepoint("Start");
     stopwatch::profile_init();
 
@@ -148,7 +156,7 @@ int main(int argc, char** argv) {
     Region.filter(Region["[Name]"] == REGION);
 
     // and n_regionkey = r_regionkey
-    auto SelectedNations = Region.inner_join(Nation, {"[RegionKey]"});
+    auto SelectedNations = join(Region, Nation, {"[RegionKey]"});
     SelectedNations.project({"[NationKey]", "[Name]"});
 
     stopwatch::timepoint("Filters");
@@ -159,54 +167,56 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("Revenue");
 
-#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+#if defined(TPCH_DUCKDB_CANONICAL_PLAN) || TPCH_SELECTIVITY_PLAN
     // DuckDB canonical association (orientation adapted to ORQ's PK/FK join contract):
     // ((((Customer join (Nation join Region)) join Orders) join Lineitem) join Supplier)
-    auto SelectedCustomers = SelectedNations.inner_join(
-        Customer, {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}});
+#if TPCH_SELECTIVITY_PLAN == 1
+    auto CustomerOrders = join(Customer, Orders, {"[CustKey]"},
+        {{"[NationKey]", "[NationKey]", copy<B>}});
+    auto SelectedOrders = join(SelectedNations, CustomerOrders, {"[NationKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    CustomerOrders.deleteTable();
+#else
+    auto SelectedCustomers = join(SelectedNations, Customer, {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}});
 
-    auto SelectedOrders = SelectedCustomers.inner_join(
-        Orders, {"[CustKey]"},
+    auto SelectedOrders = join(SelectedCustomers, Orders, {"[CustKey]"},
         {{"[Name]", "[Name]", copy<B>}, {"[NationKey]", "[NationKey]", copy<B>}});
 
-    auto CustomerItems = SelectedOrders.inner_join(
-        Lineitem, {"[OrderKey]"},
+#endif
+
+    auto CustomerItems = join(SelectedOrders, Lineitem, {"[OrderKey]"},
         {{"[Name]", "[Name]", copy<B>}, {"[NationKey]", "[NationKey]", copy<B>}});
 
-    auto FinalItems = Supplier.inner_join(CustomerItems, {"[SuppKey]", "[NationKey]"}, {});
+    auto FinalItems = join(Supplier, CustomerItems, {"[SuppKey]", "[NationKey]"}, {});
     FinalItems.deleteColumns({"[OrderKey]", "[LineNumber]", "[NationKey]", "[SuppKey]"});
 
     Customer.deleteTable();
     Orders.deleteTable();
     Lineitem.deleteTable();
     Supplier.deleteTable();
+#if !TPCH_SELECTIVITY_PLAN
     SelectedCustomers.deleteTable();
+#endif
     SelectedOrders.deleteTable();
     CustomerItems.deleteTable();
 #else
-    auto ItemsBySupplier =
-        SelectedNations.inner_join(Supplier, {"[NationKey]"}, {{"[Name]", "[Name]", copy<B>}})
-            .inner_join(Lineitem, {"[SuppKey]"},
-                        {
-                            {"[Name]", "[Name]", copy<B>},
-                        });
+    auto SelectedSuppliers = join(SelectedNations, Supplier, {"[NationKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    auto ItemsBySupplier = join(SelectedSuppliers, Lineitem, {"[SuppKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    SelectedSuppliers.deleteTable();
 
     ItemsBySupplier.deleteColumns({"[NationKey]", "[SuppKey]"});
     Supplier.deleteTable();
 
-    auto ItemsByCustomer = Nation
-                               .inner_join(Customer, {"[NationKey]"},
-                                           {
-                                               {"[Name]", "[Name]", copy<B>},
-                                           })
-                               .inner_join(Orders, {"[CustKey]"},
-                                           {
-                                               {"[Name]", "[Name]", copy<B>},
-                                           })
-                               .inner_join(Lineitem, {"[OrderKey]"},
-                                           {
-                                               {"[Name]", "[Name]", copy<B>},
-                                           });
+    auto NationCustomers = join(Nation, Customer, {"[NationKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    auto NationOrders = join(NationCustomers, Orders, {"[CustKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    auto ItemsByCustomer = join(NationOrders, Lineitem, {"[OrderKey]"},
+        {{"[Name]", "[Name]", copy<B>}});
+    NationCustomers.deleteTable();
+    NationOrders.deleteTable();
     ItemsByCustomer.deleteColumns({"[NationKey]", "[CustKey]", "[SuppKey]"});
 
     // Collect garbage
@@ -215,7 +225,7 @@ int main(int argc, char** argv) {
     Lineitem.deleteTable();
 
     auto FinalItems =
-        ItemsByCustomer.inner_join(ItemsBySupplier, {"[OrderKey]", "[LineNumber]", "[Name]"}, {});
+        join(ItemsByCustomer, ItemsBySupplier, {"[OrderKey]", "[LineNumber]", "[Name]"}, {});
     FinalItems.deleteColumns({"[OrderKey]", "[LineNumber]"});
 
     ItemsByCustomer.deleteTable();
@@ -237,17 +247,24 @@ int main(int argc, char** argv) {
     FinalItems.convert_a2b("Revenue", "[Revenue]");
     FinalItems.deleteColumns({"Revenue"});
 
+#ifdef TPCH_SELECTIVITY_EXPERIMENT
+    FinalItems.sort({std::make_pair("[Revenue]", DESC), std::make_pair("[Name]", ASC)});
+#else
     FinalItems.sort({"[Revenue]"}, DESC);
+#endif
 
     stopwatch::timepoint("Sort");
 
 #ifdef QUERY_PROFILE
     // Include the final mask and shuffle in benchmarking time
     FinalItems.finalize();
+    stopwatch::timepoint("Finalize");
 #endif
 
+    experiment.finish(FinalItems);
     stopwatch::done();          // print wall clock time
     stopwatch::profile_done();  // print profiling data
+    experiment.emit();
 
     runTime->print_statistics();
     runTime->print_communicator_statistics();
@@ -260,6 +277,8 @@ int main(int argc, char** argv) {
     auto resultOpened = FinalItems.open_with_schema();
     auto nation_name_col = FinalItems.get_column(resultOpened, "[Name]");
     auto revenue_col = FinalItems.get_column(resultOpened, "[Revenue]");
+    orq::benchmarking::tpch_experiment::result<T>({"NationName","Revenue"}, {nation_name_col,revenue_col});
+
 
     // print_table(resultOpened, pid);
 
@@ -289,7 +308,11 @@ int main(int argc, char** argv) {
                 and o.OrderDate < ? + ?
             group by n.Name
             order by Revenue desc
-        )sql";
+        )sql"
+#ifdef TPCH_SELECTIVITY_EXPERIMENT
+        ", n.Name "
+#endif
+        ;
         sqlite3_stmt* stmt;
         ret = sqlite3_prepare_v2(sqlite_db, query, -1, &stmt, NULL);
         // Fill in query placeholders
@@ -302,8 +325,9 @@ int main(int argc, char** argv) {
         auto res = sqlite3_step(stmt);
         auto i = 0;
         while (res == SQLITE_ROW) {
-            int sql_nation_name = sqlite3_column_int(stmt, 0);
-            int sql_revenue = sqlite3_column_int(stmt, 1);
+            if (i >= nation_name_col.size()) throw std::runtime_error("SQLite returned more rows than ORQ");
+            int64_t sql_nation_name = sqlite3_column_int64(stmt, 0);
+            int64_t sql_revenue = sqlite3_column_int64(stmt, 1);
 
             ASSERT_SAME(sql_nation_name, nation_name_col[i]);
             ASSERT_SAME(sql_revenue, revenue_col[i]);
@@ -329,5 +353,9 @@ int main(int argc, char** argv) {
     // Close SQLite DB
     sqlite3_close(sqlite_db);
 
+#ifndef QUERY_PROFILE
+    if (orq::benchmarking::tpch_experiment::enabled && pid == 0)
+        std::cout << "[TPCH_CORRECTNESS] sqlite=passed" << std::endl;
+#endif
     return 0;
 }

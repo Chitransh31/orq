@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    orq::benchmarking::tpch_experiment::Scope experiment("q1", TPCH_PLAN_ASSOCIATION);
     auto db = TPCDatabase<T>(sf, sqlite_db);
     single_cout("Q1 SF " << db.scaleFactor);
     single_cout("[QUERY_PLAN] query=q1 variant=" << TPCH_PLAN_VARIANT
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
     L.project({"[ShipDate]", "[ReturnFlag]", "[LineStatus]", "ExtendedPrice", "Discount", "Tax",
                "Quantity"});
 
+    experiment.begin_query();
     stopwatch::timepoint("Start");
     stopwatch::profile_init();
 
@@ -147,7 +149,7 @@ int main(int argc, char** argv) {
 
     stopwatch::timepoint("valid sort");
 
-    L.tail(6);
+    L.tail(std::min<size_t>(6, L.size()));
 
     // Use auto a2b conversion
     L["[AvgQuantity]"] = L["SumQuantity"] / L["CountQuantity"];
@@ -162,10 +164,13 @@ int main(int argc, char** argv) {
 #ifdef QUERY_PROFILE
     // Include the final mask and shuffle in benchmarking time
     L.finalize();
+    stopwatch::timepoint("Finalize");
 #endif
 
+    experiment.finish(L);
     stopwatch::done();          // print wall clock time
     stopwatch::profile_done();  // print profiling data
+    experiment.emit();
 
     runTime->print_statistics();
     runTime->print_communicator_statistics();
@@ -186,6 +191,8 @@ int main(int argc, char** argv) {
     auto ad_col = L.get_column(res, "[AvgDisc]");
     auto ap_col = L.get_column(res, "[AvgPrice]");
     auto aq_col = L.get_column(res, "[AvgQuantity]");
+    orq::benchmarking::tpch_experiment::result<T>({"ReturnFlag","LineStatus","CountOrder","SumCharge","SumDiscPrice","AvgDisc","AvgPrice","AvgQuantity"}, {rf_col,ls_col,co_col,sc_col,sd_col,ad_col,ap_col,aq_col});
+
 
     std::map<std::pair<int, int>, std::vector<T>> check;
 
@@ -220,16 +227,16 @@ int main(int argc, char** argv) {
 
         int i = 0;
         while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-            auto rf = sqlite3_column_int(stmt, 0);
-            auto ls = sqlite3_column_int(stmt, 1);
-            auto sq = sqlite3_column_int(stmt, 2);
-            auto sb = sqlite3_column_int(stmt, 3);
-            auto sd = sqlite3_column_int(stmt, 4);
-            auto sc = sqlite3_column_int(stmt, 5);
-            auto aq = sqlite3_column_int(stmt, 6);
-            auto ap = sqlite3_column_int(stmt, 7);
-            auto ad = sqlite3_column_int(stmt, 8);
-            auto co = sqlite3_column_int(stmt, 9);
+            auto rf = sqlite3_column_int64(stmt, 0);
+            auto ls = sqlite3_column_int64(stmt, 1);
+            auto sq = sqlite3_column_int64(stmt, 2);
+            auto sb = sqlite3_column_int64(stmt, 3);
+            auto sd = sqlite3_column_int64(stmt, 4);
+            auto sc = sqlite3_column_int64(stmt, 5);
+            auto aq = sqlite3_column_int64(stmt, 6);
+            auto ap = sqlite3_column_int64(stmt, 7);
+            auto ad = sqlite3_column_int64(stmt, 8);
+            auto co = sqlite3_column_int64(stmt, 9);
             // whew...
 
             // std::cout << rf << " " << ls << "\t" << \
@@ -247,11 +254,15 @@ int main(int argc, char** argv) {
         }
 
         if (ret != SQLITE_DONE) {
-            std::cerr << "SQLite error: " << sqlite3_errmsg(sqlite_db) << "\n";
+            throw std::runtime_error(sqlite3_errmsg(sqlite_db));
         }
 
         sqlite3_finalize(stmt);
     }
 #endif
     sqlite3_close(sqlite_db);
+#ifndef QUERY_PROFILE
+    if (orq::benchmarking::tpch_experiment::enabled && pid == 0)
+        std::cout << "[TPCH_CORRECTNESS] sqlite=passed" << std::endl;
+#endif
 }
