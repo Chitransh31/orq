@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import socket
 import subprocess
 import sys
 
@@ -14,7 +15,7 @@ LATENCY = "6.5ms"
 def get_interface_for_host(host):
     try:
         print(f"Checking {host} => ", end='')
-        ip = subprocess.getoutput(f"dig +short {host}").split('\n')[-1]
+        ip = socket.gethostbyname(host)
         print(f"{ip} => ", end='')
         result = subprocess.run(['ip', 'route', 'get', ip], capture_output=True, text=True, check=True)
         output = result.stdout.split()
@@ -22,7 +23,7 @@ def get_interface_for_host(host):
             iface = output[output.index("dev") + 1]
             print(iface)
             return iface
-    except subprocess.CalledProcessError:
+    except (socket.gaierror, subprocess.CalledProcessError):
         pass
 
     print("???")

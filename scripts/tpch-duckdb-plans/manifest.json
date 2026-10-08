@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "plan_kind": "Frozen DuckDB canonical optimized plans and handwritten ORQ-compatible translations",
+  "source": {
+    "duckdb_version": "1.5.4",
+    "duckdb_commit": "08e34c447b",
+    "scale_factor": 0.1,
+    "threads": 1,
+    "data_source": "DuckDB TPC-H extension DBGEN",
+    "analyze_completed": true,
+    "optimizer_mode": "optimized",
+    "generated_at_utc": "2026-09-01T09:23:37.144617+00:00",
+    "generator": "scripts/analyze_duckdb_tpch.py"
+  },
+  "portability": {
+    "portable": [
+      "logical join association",
+      "filter and projection placement where supported by the handwritten ORQ query"
+    ],
+    "not_portable": [
+      "DuckDB hash-join implementation",
+      "DuckDB probe/build orientation",
+      "DuckDB cardinality and cost estimates",
+      "DuckDB physical aggregation and sorting implementations"
+    ],
+    "orq_constraint": "EncodedTable::inner_join requires the primary or unique-key input on the left and the foreign-key input on the right."
+  },
+  "queries": {
+    "q1": {
+      "scenario": "canonical",
+      "sql": "q01.sql",
+      "explain_json": "q01.explain.json",
+      "normalized_explain_sha256": "dc189eb2a23d3cd31faacad31b887fb9d8f3c9f66d089a57dba5411d674d5d73",
+      "association_fingerprint_id": "ab22b54f50",
+      "association_tree": "lineitem",
+      "ordered_tree": "lineitem",
+      "max_actual_join_rows": null,
+      "translation_status": "no-op-control",
+      "orq_target": "q1_duckdb",
+      "translation": "Reuse ORQ Q1's scan, filter, sort, aggregate, and division plan; DuckDB's aggregation implementation is unavailable in ORQ."
+    },
+    "q3": {
+      "scenario": "canonical",
+      "sql": "q03.sql",
+      "explain_json": "q03.explain.json",
+      "normalized_explain_sha256": "c1410309329f5ca344288201e61411e153beb3b3a3562f12b5eccd419dc032ff",
+      "association_fingerprint_id": "9e2220c981",
+      "association_tree": "join(join(customer,orders),lineitem)",
+      "ordered_tree": "join[inner;l_orderkey = o_orderkey](lineitem,join[inner;c_custkey = o_custkey](orders,customer))",
+      "max_actual_join_rows": 15224,
+      "translation_status": "no-op-association-control",
+      "orq_target": "q3_duckdb",
+      "translation": "Reuse ORQ's Customer-Orders then Lineitem association and ignore DuckDB's hash probe/build orientation."
+    },
+    "q5": {
+      "scenario": "canonical",
+      "sql": "q05.sql",
+      "explain_json": "q05.explain.json",
+      "normalized_explain_sha256": "513b734e0e83fe42caf7d825c1f8c98f8ab30e858f1e202cec10d6e1a6a64c66",
+      "association_fingerprint_id": "caa229bb1d",
+      "association_tree": "join(join(join(join(customer,join(nation,region)),orders),lineitem),supplier)",
+      "ordered_tree": "join[inner;l_suppkey = s_suppkey&n_nationkey = s_nationkey](join[inner;l_orderkey = o_orderkey](lineitem,join[inner;c_custkey = o_custkey](orders,join[inner;c_nationkey = n_nationkey](customer,join[inner;n_regionkey = r_regionkey](nation,region)))),supplier)",
+      "max_actual_join_rows": 18948,
+      "translation_status": "reordered",
+      "orq_target": "q5_duckdb",
+      "translation": "Build Region-Nation-Customer-Orders-Lineitem, then join Supplier on SuppKey and NationKey; this replaces the original duplicated Lineitem branches."
+    },
+    "q8": {
+      "scenario": "canonical",
+      "sql": "q08.sql",
+      "explain_json": "q08.explain.json",
+      "normalized_explain_sha256": "de84cc16fac47404e7ef1dbb843db5565a1affeec3b08637b918a1e28502b6b5",
+      "association_fingerprint_id": "9d0bde819f",
+      "association_tree": "join(join(join(join(customer,join(join(lineitem,part),orders)),join(nation_region,region)),supplier),nation_name)",
+      "ordered_tree": "join[inner;n_nationkey = s_nationkey](join[inner;l_suppkey = s_suppkey](supplier,join[inner;c_nationkey = n_nationkey](join[inner;c_custkey = o_custkey](customer,join[inner;l_orderkey = o_orderkey](orders,join[inner;l_partkey = p_partkey](lineitem,part))),join[inner;n_regionkey = r_regionkey](nation_region,region))),nation_name)",
+      "max_actual_join_rows": 4485,
+      "translation_status": "reordered",
+      "orq_target": "q8_duckdb",
+      "translation": "Build Part-Lineitem-Orders-Customer and Region-customer-Nation branches, combine them, then join Supplier and supplier Nation."
+    },
+    "q9": {
+      "scenario": "canonical",
+      "sql": "q09.sql",
+      "explain_json": "q09.explain.json",
+      "normalized_explain_sha256": "3dc63d5986dbfc96239d9fe2605e6db918789694ae66320761a8edba377b6183",
+      "association_fingerprint_id": "69c40b364a",
+      "association_tree": "join(join(join(lineitem,part),orders),join(join(nation,supplier),partsupp))",
+      "ordered_tree": "join[inner;l_partkey = ps_partkey&l_suppkey = s_suppkey](join[inner;l_orderkey = o_orderkey](join[inner;l_partkey = p_partkey](lineitem,part),orders),join[inner;ps_suppkey = s_suppkey](partsupp,join[inner;n_nationkey = s_nationkey](supplier,nation)))",
+      "max_actual_join_rows": 80000,
+      "translation_status": "reordered",
+      "orq_target": "q9_duckdb",
+      "translation": "Build Part-Lineitem-Orders and Nation-Supplier-PartSupp branches, then join on the PartKey-SuppKey composite key."
+    }
+  }
+}

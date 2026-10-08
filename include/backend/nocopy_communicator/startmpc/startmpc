@@ -25,37 +25,6 @@ cleanup() {
     fi
 }
 
-# Local Execution
-# Run binary in a local child process
-local_execution() {
-    local command=$1
-    local base_port=$2
-    local host_count=$3
-    local host_rank=$4
-
-    # echo "Local | $command | $base_port"
-
-    # Set env vars for startmpc connection setup
-    export STARTMPC_EXEC_MODE=$LOCAL_EXEC_MODE
-    export STARTMPC_BASE_PORT=$base_port
-    export STARTMPC_HOST_COUNT=$host_count
-    export STARTMPC_HOST_RANK=$host_rank
-
-    ## (Debugging Commands)
-    ## Mac
-    # stdbuf -oL -eL lldb -b -o 'run' -k 'thread backtrace all' -o 'quit' $command
-    ## Linux
-    # stdbuf -oL -eL gdb --quiet -ex 'run' -ex 'bt' --args $command
-    ## ASAN/TSAN
-    # export ASAN_OPTIONS=new_delete_type_mismatch=0
-    # LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.6 stdbuf -oL -eL $command
-    ## Normal
-
-    stdbuf -oL -eL $command || (echo "failed; pkill $COMMAND"; sleep 1; pkill startmpc)
-
-    return $?
-}
-
 # Remote Execution
 # Run binary on specified host machine using SSH
 remote_execution() {
@@ -106,7 +75,8 @@ done
 shift $((OPTIND -1))
 
 # Remaining args assumed to be the command
-COMMAND="$@"
+COMMAND="$*"
+COMMAND_ARGS=("$@")
 
 # Check for required params
 if [ -z "$NUM_PROCESSES" ] || [ -z "$COMMAND" ]; then
@@ -117,6 +87,115 @@ fi
 # Sockets are not immediately reusable after closing, hence the random base port
 # Not very elegant, but works for now. TODO: Figure out something better
 BASE_PORT=$((RANDOM % (50000 - 10000 + 1) + 10000))
+
+# Local execution uses argv directly and only signals process groups it owns.
+# Keep this embedded so installations that copy just startmpc remain usable.
+if [ -z "$HOST_STRING" ]; then
+    exec python3 - "$NUM_PROCESSES" "$BASE_PORT" "${COMMAND_ARGS[@]}" <<'PYTHON'
+import ctypes
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+count, port = map(int, sys.argv[1:3])
+if count < 1:
+    sys.exit("Number of processes must be positive")
+children = []
+cancelled = 0
+if sys.platform == "linux":
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0):  # Reap orphaned descendants of owned parties.
+        sys.exit("startmpc: unable to become child subreaper")
+
+def adopted():
+    if sys.platform != "linux":
+        return []
+    direct = {child.pid for child in children}
+    return [int(pid) for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
+            if int(pid) not in direct]
+
+
+def cancel(signum, frame):
+    global cancelled
+    if not cancelled:
+        cancelled = signum
+
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, cancel)
+
+def send(sig):
+    for child in children:
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    for pid in adopted():
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+def alive():
+    for pid in adopted():
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+    for child in children:
+        child.poll()
+    for child in children:
+        try:
+            os.killpg(child.pid, 0)
+            return True
+        except ProcessLookupError:
+            pass
+    return bool(adopted())
+
+status = 0
+try:
+    for rank in range(count):
+        if cancelled:
+            break
+        env = dict(os.environ, STARTMPC_EXEC_MODE="0", STARTMPC_BASE_PORT=str(port),
+                   STARTMPC_HOST_COUNT=str(count), STARTMPC_HOST_RANK=str(rank))
+        children.append(subprocess.Popen(["stdbuf", "-oL", "-eL", *sys.argv[3:]],
+                                         env=env, start_new_session=True))
+    while not cancelled:
+        codes = [child.poll() for child in children]
+        failure = next((code for code in codes if code not in (None, 0)), None)
+        if failure is not None:
+            status = failure if failure >= 0 else 128 - failure
+            break
+        if all(code is not None for code in codes):
+            break
+        time.sleep(0.02)
+except OSError as exc:
+    print(f"startmpc: {exc}", file=sys.stderr)
+    status = 1
+finally:
+    status = status or (128 + cancelled if cancelled else 0)
+    send(cancelled or signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while alive() and time.monotonic() < deadline:
+        send(cancelled or signal.SIGTERM)
+        time.sleep(0.02)
+    send(signal.SIGKILL)
+    for child in children:
+        child.wait()
+    reap_deadline = time.monotonic() + 2
+    while alive() and time.monotonic() < reap_deadline:
+        send(signal.SIGKILL)
+        time.sleep(0.02)
+    if alive():
+        print("startmpc: failed to reap owned descendants", file=sys.stderr)
+        status = status or 1
+sys.exit(status or (128 + cancelled if cancelled else 0))
+PYTHON
+fi
 
 # Cleanup on exit
 trap cleanup INT TERM HUP
@@ -148,12 +227,7 @@ if [ -n "$HOST_STRING" ]; then
         (remote_execution "${HOSTS[i]}" "$COMMAND" "$BASE_PORT" "$NUM_PROCESSES" "$i" "$HOST_STRING" "$SCP_FLAG") &
         pids+=($!)
     done
-else
-    # Local execution
-    for ((i=0; i<NUM_PROCESSES; i++)); do
-        (local_execution "$COMMAND" "$BASE_PORT" "$NUM_PROCESSES" "$i") &
-        pids+=($!)
-    done
+
 fi
 
 # Wait for child processes to complete

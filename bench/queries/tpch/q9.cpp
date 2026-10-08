@@ -64,6 +64,31 @@ using T = int64_t;
 
 using sec = duration<float, seconds::period>;
 
+#if TPCH_SELECTIVITY_PLAN == 1
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-a";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(join(lineitem,part),supplier),nation),orders),partsupp)";
+#elif TPCH_SELECTIVITY_PLAN == 2
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-b";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(lineitem,part),join(nation,supplier)),orders),partsupp)";
+#elif TPCH_SELECTIVITY_PLAN == 3
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-c";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(nation,supplier),join(part,partsupp)),join(lineitem,orders))";
+#elif TPCH_SELECTIVITY_PLAN == 4
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-selectivity-d";
+constexpr auto TPCH_PLAN_ASSOCIATION = "join(join(join(join(nation,supplier),partsupp),part),join(lineitem,orders))";
+#else
+#ifdef TPCH_DUCKDB_CANONICAL_PLAN
+constexpr auto TPCH_PLAN_VARIANT = "duckdb-canonical";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(lineitem,part),orders),join(join(nation,supplier),partsupp))";
+#else
+constexpr auto TPCH_PLAN_VARIANT = "original-orq";
+constexpr auto TPCH_PLAN_ASSOCIATION =
+    "join(join(join(join(join(nation,supplier),lineitem),part),orders),partsupp)";
+#endif
+
+#endif
+
 int main(int argc, char** argv) {
     orq_init(argc, argv);
     auto pid = runTime->getPartyID();
@@ -89,12 +114,15 @@ int main(int argc, char** argv) {
 #endif
 
     // Query DB setup
+    orq::benchmarking::tpch_experiment::Scope experiment("q9", TPCH_PLAN_ASSOCIATION);
     auto db = TPCDatabase<T>(sf, sqlite_db);
 
     using A = ASharedVector<T>;
     using B = BSharedVector<T>;
 
     single_cout("Q9 SF " << db.scaleFactor);
+    single_cout("[QUERY_PLAN] query=q9 variant=" << TPCH_PLAN_VARIANT
+                                                  << " association=" << TPCH_PLAN_ASSOCIATION);
 
     ////////////////////////////////////////////////////////////////
     // Query
@@ -134,49 +162,124 @@ int main(int argc, char** argv) {
     print_table(Nation.open_with_schema(), pid);
 #endif
 
+    experiment.begin_query();
     stopwatch::timepoint("Start");
     stopwatch::profile_init();
 
     Part.filter(Part["[Name]"] == P_NAME_COLOR);
+#if TPCH_SELECTIVITY_PLAN
+    Supplier.addColumns({"[NationName]"});
+    LineItem.addColumns({"[NationName]"});
+#endif
 
     stopwatch::timepoint("Part Filter");
 
+#if TPCH_SELECTIVITY_PLAN
+#if TPCH_SELECTIVITY_PLAN == 1 || TPCH_SELECTIVITY_PLAN == 2
+    auto PL = join(Part, LineItem, {"[PartKey]"}, {});
+#if TPCH_SELECTIVITY_PLAN == 1
+    auto SL = join(Supplier, PL, {"[SuppKey]"}, {{"[NationKey]", "[NationKey]", copy<B>}});
+    auto NL = join(Nation, SL, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
+    SL.deleteTable();
+#else
+    auto NS = join(Nation, Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
+    auto NL = join(NS, PL, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
+    NS.deleteTable();
+#endif
+    auto OL = join(Orders, NL, {"[OrderKey]"}, {{"[OrderDate]", "[OrderDate]", copy<B>}});
+    auto FinalJoin = join(PartSupp, OL, {"[PartKey]", "[SuppKey]"},
+        {{"SupplyCost", "SupplyCost", copy<A>}});
+    PL.deleteTable(); NL.deleteTable(); OL.deleteTable();
+#else
+    auto NS = join(Nation, Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
+#if TPCH_SELECTIVITY_PLAN == 3
+    auto PPS = join(Part, PartSupp, {"[PartKey]"}, {});
+    auto Dimension = join(NS, PPS, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
+    PPS.deleteTable();
+#else
+    auto NPS = join(NS, PartSupp, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
+    auto Dimension = join(Part, NPS, {"[PartKey]"}, {});
+    NPS.deleteTable();
+#endif
+    auto OL = join(Orders, LineItem, {"[OrderKey]"}, {{"[OrderDate]", "[OrderDate]", copy<B>}});
+    auto FinalJoin = join(Dimension, OL, {"[PartKey]", "[SuppKey]"},
+        {{"SupplyCost", "SupplyCost", copy<A>}, {"[NationName]", "[NationName]", copy<B>}});
+    NS.deleteTable(); Dimension.deleteTable(); OL.deleteTable();
+#endif
+    Part.deleteTable(); Supplier.deleteTable(); LineItem.deleteTable(); PartSupp.deleteTable(); Orders.deleteTable();
+#elif defined(TPCH_DUCKDB_CANONICAL_PLAN)
+    // Left branch of DuckDB's canonical association: (Lineitem join Part) join Orders.
+    auto PartLineItemJoin = join(Part, LineItem, {"[PartKey]"}, {});
+    Part.deleteTable();
+    LineItem.deleteTable();
+
+    stopwatch::timepoint("PartKey Join");
+
+    auto LineItemOrderKeyJoin = join(Orders, PartLineItemJoin, {"[OrderKey]"}, {{"[OrderDate]", "[OrderDate]", copy<B>}});
+    Orders.deleteTable();
+    PartLineItemJoin.deleteTable();
+
+    stopwatch::timepoint("OrderKey Join");
+
+    // Right branch: (Nation join Supplier) join PartSupp.
     Supplier.addColumns({"[NationName]"});
     auto SuppliersJoin =
-        Nation.inner_join(Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
+        join(Nation, Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
+    Supplier.deleteTable();
+
+    stopwatch::timepoint("NationKey Join");
+
+    auto SupplierPartSuppJoin = join(SuppliersJoin, PartSupp, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
+    SuppliersJoin.deleteTable();
+    PartSupp.deleteTable();
+
+    stopwatch::timepoint("SuppKey Join");
+
+    // The composite PartSupp key is the primary side for the final ORQ join.
+    auto FinalJoin = join(SupplierPartSuppJoin, LineItemOrderKeyJoin, {"[PartKey]", "[SuppKey]"},
+        {{"SupplyCost", "SupplyCost", copy<A>},
+         {"[NationName]", "[NationName]", copy<B>}});
+    SupplierPartSuppJoin.deleteTable();
+    LineItemOrderKeyJoin.deleteTable();
+
+    stopwatch::timepoint("PartSupp Join");
+#else
+    Supplier.addColumns({"[NationName]"});
+    auto SuppliersJoin =
+        join(Nation, Supplier, {"[NationKey]"}, {{"[Name]", "[NationName]", copy<B>}});
 
     Supplier.deleteTable();
 
     stopwatch::timepoint("NationKey Join");
 
-    auto LineItemSuppKeyJoin = SuppliersJoin.inner_join(
-        LineItem, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
+    auto LineItemSuppKeyJoin = join(SuppliersJoin, LineItem, {"[SuppKey]"}, {{"[NationName]", "[NationName]", copy<B>}});
 
     SuppliersJoin.deleteTable();
     LineItem.deleteTable();
 
     stopwatch::timepoint("SuppKey Join");
 
-    auto LineItemPartKeyJoin = Part.inner_join(LineItemSuppKeyJoin, {"[PartKey]"}, {});
+    auto LineItemPartKeyJoin = join(Part, LineItemSuppKeyJoin, {"[PartKey]"}, {});
 
     Part.deleteTable();
     LineItemSuppKeyJoin.deleteTable();
     stopwatch::timepoint("PartKey Join");
 
-    auto LineItemOrderKeyJoin = Orders.inner_join(LineItemPartKeyJoin, {"[OrderKey]"},
+    auto LineItemOrderKeyJoin = join(Orders, LineItemPartKeyJoin, {"[OrderKey]"},
                                                   {{"[OrderDate]", "[OrderDate]", copy<B>}});
 
     Orders.deleteTable();
     LineItemPartKeyJoin.deleteTable();
     stopwatch::timepoint("OrderKey Join");
 
-    auto FinalJoin = PartSupp.inner_join(LineItemOrderKeyJoin, {"[PartKey]", "[SuppKey]"},
+    auto FinalJoin = join(PartSupp, LineItemOrderKeyJoin, {"[PartKey]", "[SuppKey]"},
                                          {{"SupplyCost", "SupplyCost", copy<A>}});
 
     PartSupp.deleteTable();
     LineItemOrderKeyJoin.deleteTable();
 
     stopwatch::timepoint("PartSupp Join");
+#endif
 
     FinalJoin.project(
         {"[NationName]", "[OrderDate]", "ExtendedPrice", "Discount", "Quantity", "SupplyCost"});
@@ -200,10 +303,13 @@ int main(int argc, char** argv) {
 #ifdef QUERY_PROFILE
     // Include the final mask and shuffle in benchmarking time
     FinalJoin.finalize();
+    stopwatch::timepoint("Finalize");
 #endif
 
+    experiment.finish(FinalJoin);
     stopwatch::done();          // print wall clock time
     stopwatch::profile_done();  // print profiling data
+    experiment.emit();
 
     runTime->print_statistics();
     runTime->print_communicator_statistics();
@@ -217,6 +323,8 @@ int main(int argc, char** argv) {
     auto nation = FinalJoin.get_column(result, "[NationName]");
     auto o_year = FinalJoin.get_column(result, "[OrderDate]");
     auto sum_profit = FinalJoin.get_column(result, "SumProfit");
+    orq::benchmarking::tpch_experiment::result<T>({"NationName","OrderDate","Profit"}, {nation,o_year,sum_profit});
+
 
     if (pid == 0) {
         // Fetch Q9 SQL result to validate
@@ -265,9 +373,9 @@ int main(int argc, char** argv) {
 
         int i = 0;
         while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-            int sqlNation = sqlite3_column_int(stmt, 0);
-            int sqlYear = sqlite3_column_int(stmt, 1);
-            int sqlProfit = sqlite3_column_int(stmt, 2);
+            int64_t sqlNation = sqlite3_column_int64(stmt, 0);
+            int64_t sqlYear = sqlite3_column_int64(stmt, 1);
+            int64_t sqlProfit = sqlite3_column_int64(stmt, 2);
 
             // std::cout << "nation: " << sqlNation << " | " << "o_year: " << sqlYear << " | " <<
             // "sum_profit: " << sqlProfit << std::endl; std::cout << "nation: " << nation[i] << " |
@@ -287,7 +395,7 @@ int main(int argc, char** argv) {
         }
 
         if (ret != SQLITE_DONE) {
-            single_cout("Error executing statement: " << sqlite3_errmsg(sqlite_db));
+            throw std::runtime_error(sqlite3_errmsg(sqlite_db));
         }
     }
 
@@ -295,5 +403,9 @@ int main(int argc, char** argv) {
     // Close SQLite DB
     sqlite3_close(sqlite_db);
 
+#ifndef QUERY_PROFILE
+    if (orq::benchmarking::tpch_experiment::enabled && pid == 0)
+        std::cout << "[TPCH_CORRECTNESS] sqlite=passed" << std::endl;
+#endif
     return 0;
 }

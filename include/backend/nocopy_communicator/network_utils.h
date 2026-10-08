@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cerrno>
 #include <iostream>
 
 #include "core/communication/ring.h"
@@ -64,7 +66,7 @@ int socket_create(int port) {
     return server_sock;
 }
 
-int socket_connect(const std::string& hostname, int port) {
+int socket_connect_direct(const std::string& hostname, int port) {
     struct addrinfo hints{}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -99,6 +101,38 @@ int socket_connect(const std::string& hostname, int port) {
 
     freeaddrinfo(res);
     return sockfd;
+}
+
+// Opt-in userspace relay. Ordinary NoCopy connections are unchanged when unset.
+int socket_connect(const std::string& hostname, int port) {
+    const char* relay_port = std::getenv("ORQ_WAN_PROXY_PORT");
+    if (!relay_port) return socket_connect_direct(hostname, port);
+    char* end = nullptr;
+    const long parsed = std::strtol(relay_port, &end, 10);
+    if (!*relay_port || *end || parsed < 1 || parsed > 65535 ||
+        hostname.find_first_of("\t\r\n") != std::string::npos) {
+        throw std::runtime_error("Invalid userspace WAN relay endpoint");
+    }
+    int sock = socket_connect_direct("127.0.0.1", static_cast<int>(parsed));
+    const std::string request = hostname + "\t" + std::to_string(port) + "\n";
+    size_t sent = 0;
+    while (sent < request.size()) {
+        auto n = send(sock, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            close(sock);
+            throw std::runtime_error("Userspace WAN relay handshake send failed");
+        }
+        sent += n;
+    }
+    char reply = 0;
+    ssize_t received;
+    do { received = recv(sock, &reply, 1, 0); } while (received < 0 && errno == EINTR);
+    if (received != 1 || reply != 'O') {
+        close(sock);
+        throw std::runtime_error("Userspace WAN relay connection failed");
+    }
+    return sock;
 }
 
 int send_meta(int sockfd, int byte_count) {

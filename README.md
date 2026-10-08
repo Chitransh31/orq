@@ -23,13 +23,14 @@ ORQ is a multi-party computation framework for relational analytics. For more in
 ## Table of Contents
 
 - [Summary of Changes](#summary-of-changes)
+- [Fork Experiments](#fork-experiments)
 - [Dependencies](#dependencies)
 - [Building ORQ](#building-orq)
   - [Single-Node](#single-node)
   - [Multi-Node](#multi-node)
 - [Running ORQ](#running-orq)
   - [Compiling ORQ Programs](#compiling-orq-programs)
-  - [`run_experiment.sh`](#run_experimentsh)
+  - [`run_experiment.py`](#run_experimentpy)
   - [Running ORQ Programs Locally](#running-orq-programs-locally)
   - [Running ORQ Programs on Multiple Servers](#running-orq-programs-on-multiple-servers)
   - [Running ORQ Programs in Simulated WAN](#running-orq-programs-in-simulated-wan)
@@ -66,6 +67,38 @@ The second version of the ORQ codebase includes the following updates:
 
 This version of our codebase corresponds to the ACM TOCS journal submission.
 
+
+## Fork Experiments
+
+This fork adds DuckDB selectivity studies and fixed-plan ORQ comparisons for
+TPC-H Q1, Q3, Q5, Q8, and Q9. The [experiment instructions](scripts/README.md)
+cover dependencies, cluster setup, correctness checks, LAN/WAN runs, smoke/full
+selectivity grids, detached execution, and reporting.
+
+| Experiment | Entry point |
+| --- | --- |
+| Original and canonical DuckDB-derived ORQ plans | `scripts/run-tpch-plain-and-3pc.sh --plan-set both` |
+| DuckDB original-predicate sweeps | `python3 scripts/analyze_duckdb_tpch.py --sweep-preset legacy` |
+| Controlled DuckDB direct/materialized study | `python3 scripts/analyze_duckdb_tpch.py --sweep-preset controlled-common` |
+| ORQ public input reduction | `scripts/run-tpch-selectivity-3pc.sh` |
+| Detached presentation matrix | `python3 scripts/tpch_supervisor.py` |
+| Saved-result figures | `scripts/plot_duckdb_tpch.py`, `scripts/plot_orq_presentation.py` |
+
+Inspect the original-plan commands without launching experiments. For the
+selectivity dry run, first restore the frozen evidence described in the
+[scripts README](scripts/README.md#frozen-duckdb-evidence):
+
+```bash
+scripts/run-tpch-plain-and-3pc.sh --plan-set both --dry-run
+scripts/run-tpch-selectivity-3pc.sh --grid smoke --modes lan --repetitions 1 --dry-run
+```
+
+Use the correctness runs described in the scripts README before collecting
+performance results. Public input reduction occurs before secret sharing and
+does not measure secure filtering or compaction costs. Userspace WAN simulation
+provides a qualitative latency comparison; its configured cap is not a measured
+network throughput guarantee. Generated measurements and figures are saved in
+Git-ignored `results/` and `outputs/` directories.
 
 ## Dependencies
 
@@ -181,32 +214,24 @@ $ make -j other-queries
 
 See `debug/orq_debug.h` and `CMakeLists.txt` for more information on compile options. Not all compile options are made available via CMake and instead must be manually configured within `orq_debug.h`.
 
-### `run_experiment.sh`
+### `run_experiment.py`
 
-We provide an execution harness script, `run_experiment.sh`, which automates the compilation and execution process. **This is the recommended method of running ORQ programs.**
+We provide an execution harness script, `run_experiment.py`, which automates the compilation and execution process. **This is the recommended method of running ORQ programs.**
 
-To see a comprehensive set of options for the `run_experiment` script, simply run it without arguments to display a help message.
+Run the Python harness from `scripts/` or `build/`. For its current options:
 
 ```bash
-Usage: ../scripts/run_experiment.sh [options] <exp_name>
-  exp_name Experiment to run
-OPTIONS:
-  [-h]                                    Show this help
-  [-p 1|2|3|4]                            Protocol; default: 3
-  [-s same|lan|wan]                       Setting; default: same
-  [-c mpi|nocopy]                         Communicator; default: mpi for same; nocopy otherwise"
-  [-n num_comm_threads]                   [NoCopyComm only] Number of communicator threads (negative: # per worker); default: -1
-  [-r min_rows_pow[-max_rows_pow]]        Number of rows, as powers of 2, can be a range; default: 20
-  [-d]                                    Use powers of 10 for the number of rows flag (-r)
-  [-f scale_factor]                       Scale factor for TPC-H and other queries. Overrides -r if set.
-  [-t min_threads_pow[-max_threads_pow]]  Number of threads, as powers of 2, can be a range
-  [-T threads]                            Number of threads (arbitrary); default: 1
-  [-b batch_size]                         Batch size; default: -12
-  [-e exp_repetitions]                    Number of times to repeat each rows/threads pairing; default: {exp_repetitions}
-  [-m cmake_args]                         Pass additional arguments to cmake (can be repeated for more)
-  [-a experiment_args]                    Pass additional arguments to the experiment binary (can be repeated for more)
-  [-x node prefix]                        Prefix for remote nodes. Machines are prefix0, prefix1, ...; default: node
+python3 ../scripts/run_experiment.py --help
 ```
+
+Common options are `-p 1|2|3|4` (protocol), `-s same|lan|wan` (setting),
+`-c mpi|nocopy` (communicator), `-f` (TPC-H scale factor), `-T` (worker threads),
+`-e` (repetitions), and `--hosts` (comma-separated party hostnames). `-r` accepts
+literal row counts or expressions such as `'2^24'`; `-t 0-5` varies worker counts
+from 1 to 32. Repeat `-m` for CMake settings and `-a` for binary arguments.
+Use `--wan-sim userspace-distributed` for distributed WAN simulation without
+sudo, or `--wan-sim off` for an existing network. The
+[scripts README](scripts/README.md) describes all WAN modes and their requirements.
 
 ### Running ORQ Programs Locally
 
@@ -216,7 +241,7 @@ A minimal test:
 
 ```bash
 $ cd build
-$ ../scripts/run_experiment.sh test_primitives
+$ ../scripts/run_experiment.py test_primitives
 # ... everything should pass ...
 ```
 
@@ -232,7 +257,7 @@ This command will run the program `test_primitives.cpp` with all default options
 
 We can try a different program:
 ```bash
-$ ../scripts/run_experiment.sh micro_primitives    
+$ ../scripts/run_experiment.py micro_primitives
 # ...
 Vector 1048576 x 32b
 [=SW]            Start
@@ -249,7 +274,7 @@ Vector 1048576 x 32b
 
 More rows ($2^{24}\approx 16\mathrm{M}$):
 ```bash
-$ ../scripts/run_experiment.sh -r 24 micro_primitives
+$ ../scripts/run_experiment.py -r '2^24' micro_primitives
 # ...
 Vector 16777216 x 32b
 [=SW]            Start
@@ -267,7 +292,7 @@ Vector 16777216 x 32b
 A different protocol (Malicious-secure Fantastic 4PC):
 
 ```bash 
-$ ../scripts/run_experiment.sh -r 24 -p 4 micro_primitives
+$ ../scripts/run_experiment.py -r '2^24' -p 4 micro_primitives
 # ...
 Vector 16777216 x 32b
 [=SW]            Start
@@ -285,7 +310,7 @@ Vector 16777216 x 32b
 Or more threads:
 
 ```bash
-$ ../scripts/run_experiment.sh -r 24 -p 4 -T 4 micro_primitives
+$ ../scripts/run_experiment.py -r '2^24' -p 4 -T 4 micro_primitives
 # ...
 Vector 16777216 x 32b
 [=SW]            Start
@@ -304,13 +329,13 @@ You should not expect much of a speedup with more threads when running locally: 
 
 ### Running ORQ Programs on Multiple Servers
 
-ORQ programs can be run over LAN just by changing the setting (`-s`) argument to `run_experiment.sh`:
+ORQ programs can be run over LAN just by changing the setting (`-s`) argument to `run_experiment.py`:
 
 ```
-$ ../scripts/run_experiment.sh -s lan -c nocopy -n 4 -T 8 micro_sorting
+$ ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
 ```
 
-This runs the `micro_sorting` experiment, with the 3PC protocol (the default), on nodes `node0`, `node1`, and `node2`. We use the `nocopy` communicator with `4` communication threads and `8` worker threads. `run_experiment.sh` takes care of configuring the other nodes, and copies the compiled binary from `node0` to all other nodes in the cluster. 
+This runs the `micro_sorting` experiment, with the 3PC protocol (the default), on nodes `node0`, `node1`, and `node2`. We use the `nocopy` communicator with `4` communication threads and `8` worker threads. `run_experiment.py` takes care of configuring the other nodes, and copies the compiled binary from `node0` to all other nodes in the cluster.
 
 > [!WARNING]
 > ORQ programs will crash in mysterious ways if different versions of a binary are present on different hosts.
@@ -321,7 +346,7 @@ This runs the `micro_sorting` experiment, with the 3PC protocol (the default), o
 > If your machines are named something else, you can specify a new prefix with `-x [node]`. However, our scripts assume a consistent numbering:
 > 
 > ```bash
-> $ ../scripts/run_experiment.sh -s lan -p 4 -x lab-server- test_primitives
+> $ ../scripts/run_experiment.py -s lan -p 4 -x lab-server- test_primitives
 > ```
 > 
 > This will run `test_primitives`, with the 4PC protocol, on nodes `lab-server-0`,`lab-server-1`, `lab-server-2`, and `lab-server-3`.
@@ -329,7 +354,7 @@ This runs the `micro_sorting` experiment, with the 3PC protocol (the default), o
 To check the scaling behavior of ORQ, we can use the variable-thread (`-t`) argument. This example will run `micro_sorting` in LAN, with the 3PC protocol, using `1, 2, 4, 8, 16, 32` worker threads.
 
 ```bash
-$ ../scripts/run_experiment.sh -s lan -c nocopy -n 4 -t 0-5 micro_sorting
+$ ../scripts/run_experiment.py -s lan -c nocopy -n 4 -t 0-5 micro_sorting
 ```
 
 ### Running ORQ Programs in Simulated WAN
@@ -343,11 +368,15 @@ The WAN simulator is very easy to use:
 # Turn on simWAN for node0 (implied), node1, node2, and node3
 $ ../scripts/comm/cluster-wan-sim.sh on node{1,2,3}
 # Run your experiment
-# [Soon, run_experiment will handle running cluster-wan-sim for you]
-$ ../scripts/run_experiment.sh -s wan ...
+# run_experiment.py manages cluster-wan-sim automatically for -s wan
+$ ../scripts/run_experiment.py -s wan ...
 # Disable simWAN
 $ ../scripts/comm/cluster-wan-sim.sh off node{1,2,3}
 ```
+
+Use `--wan-sim off` with `run_experiment.py` when the hosts are already
+geographically distributed and their real network conditions should be left
+unchanged.
 
 This simple script makes some assumptions about the network topology (e.g., that all nodes are routable over the same interface), so modifications may be required for more complex deployments.
 
@@ -413,7 +442,7 @@ The first argument specifies the suite of queries:
 
 The next argument, `sf` refers to Scale Factor. For TPC-H, this is a well-defined term in the specification. For other queries, we define SF1 to be approximately the same size, on average; that is, about 5M rows.
 
-`enviro` is as in `run_experiment.sh`: it may be `lan`, `wan`, or `same` (local).
+`enviro` is as in `run_experiment.py`: it may be `lan`, `wan`, or `same` (local).
 
 ## Writing New ORQ Programs
 
@@ -472,3 +501,7 @@ When the cluster has been successfully created, you can SSH into `node0` and fol
   doi       = {https://doi.org/10.1145/3731569.3764833},
 }
 ```
+
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the original ORQ contributors.

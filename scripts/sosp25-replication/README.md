@@ -1,5 +1,17 @@
 # Reproducibility Instructions
 
+This README describes the original SOSP evaluation. The fork's current
+DuckDB and ORQ experiments are documented in [scripts/README.md](../README.md).
+The authors' archived evaluation is the upstream `sosp-artifact` tag; use that
+revision for exact paper reproduction and its matching instructions. Historical
+AWS access via HotCRP applied to the artifact evaluation and is not provided by
+this fork. Use your own cluster for the experiments in this submission.
+
+Paths below use the current `sosp25-replication/` directory. Some legacy wrappers
+still contain `scripts/sosp25/` paths or old row-range arguments; they require
+adaptation on the current codebase. The fork's focused/selectivity runners use
+the current Python harness and are the entry points for its new measurements.
+
 ## Overview
 
 We target all three artifact badges:
@@ -60,7 +72,7 @@ _Time: 10 minutes_
 
 We begin by giving a description of each artifact component and its relation to the paper. All code for ORQ is contained in our public repository. Important components to highlight:
 - `scripts/`
-    - `sosp25`: all scripts for reproducing our experiments
+    - `sosp25-replication`: all scripts for reproducing our experiments
     - `orchestration/aws`: scripts for launching an AWS cluster (we have run this for you)
 - `include/`: our main framework, including
     - `core/communication/no_copy_communicator`: our custom communication layer
@@ -210,19 +222,19 @@ $ cd ~/orq
 # any of the following commands can be skipped in the interest of time
 $
 # two party lan and wan
-$ ./scripts/sosp25/artifact-tpch.sh 2 lan # ~ 3.5 hr
-$ ./scripts/sosp25/artifact-tpch.sh 2 wan # ~ 9 hr
+$ ./scripts/sosp25-replication/artifact-tpch.sh 2 lan # ~ 3.5 hr
+$ ./scripts/sosp25-replication/artifact-tpch.sh 2 wan # ~ 9 hr
 $
 # three party lan and wan
-$ ./scripts/sosp25/artifact-tpch.sh 3 lan # ~ 3 hr
-$ ./scripts/sosp25/artifact-tpch.sh 3 wan # ~ 6.5 hr
+$ ./scripts/sosp25-replication/artifact-tpch.sh 3 lan # ~ 3 hr
+$ ./scripts/sosp25-replication/artifact-tpch.sh 3 wan # ~ 6.5 hr
 $
 # four party lan and wan
-$ ./scripts/sosp25/artifact-tpch.sh 4 lan # ~ 6.5 hr
-$ ./scripts/sosp25/artifact-tpch.sh 4 wan # ~ 16 hr
+$ ./scripts/sosp25-replication/artifact-tpch.sh 4 lan # ~ 6.5 hr
+$ ./scripts/sosp25-replication/artifact-tpch.sh 4 wan # ~ 16 hr
 $
 # once you've run the experiments you want to run, generate a plot
-$ ./scripts/sosp25/artifact-tpch.sh plot
+$ ./scripts/sosp25-replication/artifact-tpch.sh plot
 ```
 
 The full experiments take a long time. We estimate that running all 31 queries end-to-end takes, approximately:
@@ -241,9 +253,9 @@ You do not need to run all experiments to generate a partial plot. The plotting 
 >
 > ```bash
 > # run queries Q1, Q9, and Q17 in 3PC LAN
-> $ ./scripts/sosp25/artifact-tpch.sh 3 lan 1,9,17
+> $ ./scripts/sosp25-replication/artifact-tpch.sh 3 lan 1,9,17
 > # run queries Q8 through Q15 in 2PC WAN
-> $ ./scripts/sosp25/artifact-tpch.sh 2 wan 8..15
+> $ ./scripts/sosp25-replication/artifact-tpch.sh 2 wan 8..15
 > ```
 > 
 > Note that when running a subset of TPC-H queries, we still run all `Other` queries, since these complete quickly, even in the slowest setting.
@@ -261,14 +273,14 @@ To replicate the Secrecy comparison, run the script for both Secrecy and ORQ:
 ```bash
 $ cd ~/orq
 # Run secrecy queries and collect data
-$ ./scripts/sosp25/secrecy/run_secrecy.sh
+$ ./scripts/sosp25-replication/secrecy/run_secrecy.sh
 # Run ORQ queries and collect data
-$ ./scripts/sosp25/secrecy/run_orq.sh
+$ ./scripts/sosp25-replication/secrecy/run_orq.sh
 # Generate Plot
-$ ./scripts/sosp25/secrecy/plot_comparison.py
+$ ./scripts/sosp25-replication/secrecy/plot_comparison.py
 ```
 
-The output plot is placed in `scripts/sosp25/secrecy/`.
+The output plot is placed in `scripts/sosp25-replication/secrecy/`.
 
 The Secrecy experiments take a long time (**8+ hours**). ORQ will take about five minutes. The output plot will look like this:
 
@@ -296,10 +308,10 @@ The sorting experiment can be run using the following commands:
 cd ~/orq
 
 # Runs the complete experiment for both systems
-./scripts/sosp25/secretflow/artifact-secretflow-sort.sh
+./scripts/sosp25-replication/secretflow/artifact-secretflow-sort.sh
 
 # Once the experiments are complete, this command can be used to generate plots
-./scripts/sosp25/secretflow/artifact-secretflow-sort.sh plot
+./scripts/sosp25-replication/secretflow/artifact-secretflow-sort.sh plot
 ```
 The raw result along with the generated plot will be available in the `~/orq/results/secretflow-sort` directory once the above commands have been run. Here is an example plot from this experiment:
 
@@ -314,10 +326,10 @@ The comparison with SecretFlow on queries can be run using the following command
 cd ~/orq
 
 # Runs the complete experiment for both systems
-./scripts/sosp25/secretflow/artifact-secretflow-tpch.sh
+./scripts/sosp25-replication/secretflow/artifact-secretflow-tpch.sh
 
 # Once the experiments are complete, this command can be used to generate plots
-./scripts/sosp25/secretflow/artifact-secretflow-tpch.sh plot
+./scripts/sosp25-replication/secretflow/artifact-secretflow-tpch.sh plot
 ```
 
 > This script for the query comparison requires the following [_Note: These steps have already been completed on the AWS cluster that we will provide to you_] :
@@ -332,14 +344,14 @@ The raw result along with the generated plot will be available in the `~/orq/res
 
 _Time: approximately 1 day_
 
-To reproduce the comparison with MP-SPDZ's sorting implementations, the relevant files are in `scripts/sosp25/mpspdz/reproducibility`. The entire comparison can be run with a single script: `full-experiment.sh`. Make sure to call this from the `mpspdz/reproducibility` directory. This script will run the ORQ benchmarks, then it will run the MP-SPDZ benchmarks, and then it will plot the result. The ORQ benchmarks will take 2-3 hours, while the MP-SPDZ benchmarks will take approximately 18 hours.
+To reproduce the comparison with MP-SPDZ's sorting implementations, the relevant files are in `scripts/sosp25-replication/mpspdz/reproducibility`. The entire comparison can be run with a single script: `full-experiment.sh`. Make sure to call this from the `mpspdz/reproducibility` directory. This script will run the ORQ benchmarks, then it will run the MP-SPDZ benchmarks, and then it will plot the result. The ORQ benchmarks will take 2-3 hours, while the MP-SPDZ benchmarks will take approximately 18 hours.
 
 The plot in the paper for the comparison shows that ORQ can be run on larger inputs than MP-SPDZ. We run MP-SPDZ on all input sizes that we run ORQ. It is possible that 2PC execution of MP-SPDZ at the largest size will succeed, although it frequently crashes at this size. 3PC and 4PC execution of MP-SPDZ will run out of memory at the largest input size and silently crash. We omit the annotations from the plot when reproducing the results.
 
 To run the script, execute the commands below.
 
 ```bash
-$ cd ~/orq/scripts/sosp25/mpspdz/reproducibility/
+$ cd ~/orq/scripts/sosp25-replication/mpspdz/reproducibility/
 # we recommend using tmux or screen since this will take a while
 $ screen -S mpspdz
 $ ./full-experiment.sh
@@ -361,7 +373,7 @@ The largest two input sizes require machines with additional RAM. If you wish to
 The script takes an optional parameter of the maximum power of two input size. By default, the maximum power of two input size is $2^{27}$. Running with inputs up to $2^{25}$ would take approximately 5 hours. Running with inputs up to $2^{29}$ would take approximately 36 hours.
 
 ```bash
-$ cd ~/orq/scripts/sosp25/sorting-main/
+$ cd ~/orq/scripts/sosp25-replication/sorting-main/
 $ screen -S sorting-main
 # runs input sizes up to and including 2^25
 $ ./sorting-main.sh 25
